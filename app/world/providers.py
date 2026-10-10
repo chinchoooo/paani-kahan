@@ -27,7 +27,7 @@ from .tiles import TileKey
 
 SCHEMA = 3  # bump when the parsed OSM format changes
 OSM_TTL_S = 30 * 24 * 3600
-MAJOR = "motorway|trunk|primary|secondary|motorway_link|trunk_link|primary_link|secondary_link"
+MAJOR = "motorway|trunk|primary|motorway_link|trunk_link|primary_link"  # main-road tiles: keep them light
 HIGHWAYS = ("motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|"
             "motorway_link|trunk_link|primary_link|secondary_link|tertiary_link")
 OVERPASS_URLS = net.env_list("OVERPASS_URLS", ["https://overpass-api.de/api/interpreter",
@@ -70,9 +70,7 @@ out center;"""
 out geom;
 relation["natural"="water"]({pb});
 out geom;""" if not major else f"""
-(way["natural"="water"]["water"~"lake|reservoir|river|lagoon"]({pb});way["landuse"="reservoir"]({pb}););
-out geom;
-relation["natural"="water"]["water"~"lake|reservoir|river|lagoon"]({pb});
+(way["natural"="water"]["water"~"lake|reservoir"]({pb});way["landuse"="reservoir"]({pb}););
 out geom;"""
         return f"""[out:json][timeout:150];
 way["highway"~"^({roads})$"]({tb})->.roads;

@@ -150,7 +150,8 @@ class World:
         self.log = log
         self.osm, self.terrain, self.cache = make_providers(data_dir)
         self.synthetic = getattr(self.osm, "synthetic", False)
-        self.sched = Scheduler({"net": int(os.getenv("NET_WORKERS", "3")), "cpu": int(os.getenv("CPU_WORKERS", str(max(1, min(3, (os.cpu_count() or 2) - 0)))))})
+        # 'bulk' = one lane for the heavy 38 km main-road downloads, so they never crowd out your streets
+        self.sched = Scheduler({"bulk": 1, "net": int(os.getenv("NET_WORKERS", "5")), "cpu": int(os.getenv("CPU_WORKERS", str(max(1, min(3, (os.cpu_count() or 2) - 0)))))})
         self.rain = RainService(self.cache)
         self.ctx = ContextService(data_dir / "world", lambda k, fn, prio, pool: self.sched.submit(k, fn, prio, pool))
         self.lock = threading.RLock()
@@ -206,7 +207,8 @@ class World:
             t.last_seen = time.time()
         prio = self._prio(cls, t.key)
         if t.status in ("new", "failed"):
-            self.sched.submit(f"fetch:{t.key}", lambda: self._fetch(t), prio, "net",
+            pool = "bulk" if t.key.lod is REGION_LOD and cls in (REGION, IDLE) else "net"
+            self.sched.submit(f"fetch:{t.key}", lambda: self._fetch(t), prio, pool,
                               on_done=lambda j: j.state == "done" and self._after_fetch(t, cls, forecast))
         elif t.status == "fetched":
             self._after_fetch(t, cls, forecast)
@@ -235,6 +237,7 @@ class World:
             if not data["ways"]:
                 t.status = "empty"
                 self._emit("tiles", str(key))
+                self._maybe_region()
                 return
             pb = key.padded_bbox()
             cell = key.lod.cell_m
@@ -246,6 +249,7 @@ class World:
         except Exception as e:
             t.status, t.error = "failed", f"{type(e).__name__}: {e}"[:200]
             self._emit("tiles", str(key))
+            self._maybe_region()
             raise
 
     def _build(self, t: Tile):
@@ -275,6 +279,8 @@ class World:
             with self.lock:
                 self._routers.clear()
             self._emit("tiles", str(key))
+            if key.lod is DETAIL:
+                self._maybe_region()
             if self.store:
                 self.sched.submit(f"idx-tile:{key}", lambda: self.store.index_tile(t), (IDLE, 0), "net")
         except Exception as e:
@@ -418,14 +424,26 @@ class World:
             return
         for k in tiles_within(lat, lon, DETAIL_KM, DETAIL.z):
             self.want(k, NEAR)
-        for i, k in enumerate(tiles_within(lat, lon, REGION_KM, REGION_LOD.z)):
-            d = km_between((lat, lon), k.center)
-            self.want(k, REGION if d < 45 else IDLE, forecast=True)
+        self._region_plan = (lat, lon)
+        self._maybe_region()
         if self.rain.source != "demo":
             from .tiles import bbox_around
             bb = bbox_around(lat, lon, min(REGION_KM, 60))
             self.sched.submit(f"rain-prefetch:{round(lat, 1)}:{round(lon, 1)}:{self.rain.run.id}", lambda: self.rain.ensure(bb), (NEAR, 0), "net")
         self.ctx.climate_for(lat, lon, prio=(NEAR, 0))
+
+    def _maybe_region(self):
+        """Main roads for 100 km start only once the streets near you are in: your area first, always."""
+        plan = getattr(self, "_region_plan", None)
+        if not plan:
+            return
+        near = [self.tiles.get(str(k)) for k in tiles_within(*plan, DETAIL_KM, DETAIL.z)]
+        if any(t is None or t.status not in ("ready", "empty", "failed") for t in near):
+            return
+        self._region_plan = None
+        for k in tiles_within(*plan, REGION_KM, REGION_LOD.z):
+            d = km_between(plan, k.center)
+            self.want(k, REGION if d < 45 else IDLE, forecast=True)
 
     def progress(self, lat=None, lon=None):
         lat, lon = (lat, lon) if lat is not None else (self.focus or (None, None))

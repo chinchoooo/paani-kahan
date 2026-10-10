@@ -315,8 +315,8 @@ function wantedTiles() {
       out.push(tl);
     }
   };
-  if (showDetail()) add(DZ);
-  add(RZ);
+  // street-level tiles when zoomed in; the big main-road tiles only when zoomed out (the basemap covers the rest)
+  if (showDetail()) add(DZ); else add(RZ);
   return out.sort((a, b) => a.dist - b.dist);
 }
 async function fetchGeo(tl) {
@@ -1133,7 +1133,7 @@ function homeView() {
       <div class="kv2"><div><b class="num">${fc.total_mm}</b><span>mm of rain</span></div><div><b class="num">${esc(short(fc.times[peakI]))}</b><span>heaviest rain</span></div><div><b class="num">${worstN}</b><span>streets over ${limit()} cm on screen</span></div></div>
       ${worstN ? `<button class="btn ghost" data-act="worst" data-f="${worstF}">Show the worst moment, ${esc(clockAt(worstF * 10))}</button>` : ""}</div>
     ${coverageCard()}
-    <div class="sec"><div class="btns">${!live ? "" : `<button class="btn ghost" data-act="demo-here">${ICON.storm}Demo storm here</button>`}
+    <div class="sec"><div class="btns">${live ? `<button class="btn ghost" data-act="demo-here">${ICON.storm}Demo storm here</button>` : `<button class="btn primary" data-act="go-live">Back to live rain</button>`}
         ${per && live ? `<button class="btn ghost" data-act="edit-commute">Edit commute</button>` : ""}
         <button class="btn ghost" data-act="how">How it works</button></div>
       <div class="hint">${S.cfg.synthetic ? "Synthetic streets (offline mode)." : "Streets © OpenStreetMap contributors · terrain: AWS Terrain Tiles."}</div></div>`;
@@ -1497,11 +1497,12 @@ function act(a, b) {
     refreshPlan(true);
   }
   if (a === "demo-here") setRain("demo");
+  if (a === "go-live") setRain("live");
   if (a === "tick" || a === "reset") systemAct(a, b);
 }
 async function setRain(source) {
   const [lat, lon] = S.me ? [S.me.lat, S.me.lon] : unproj(V.cx, V.cy);
-  snack(source === "demo" ? "Starting the demo storm on the streets around you…" : "Switching rain source…", 4000);
+  snack(source === "demo" ? "Starting the demo storm on the streets around you…" : source === "live" ? "Back to live rain from Open-Meteo…" : "Switching rain source…", 4000);
   const r = await api("/api/rain", { source, lat, lon });
   if (!r.ok) notice(`<div class="h">Couldn't switch</div><div class="b">${esc(r.j?.error || "Try again in a moment.")}</div><div class="btns"><button class="btn ghost" data-n="ok">OK</button></div>`);
 }
@@ -1688,6 +1689,8 @@ $$("[data-layer]").forEach((c) => c.addEventListener("click", () => {
 }));
 
 /* --------------------------------------------------------------- drawer */
+$("#drawer").addEventListener("pointerdown", () => { S.drawerTouch = performance.now(); });
+$("#drawer").addEventListener("scroll", () => { S.drawerTouch = performance.now(); }, true);
 function toggleDrawer(on) { S.drawer = on ?? !S.drawer; $("#drawer").hidden = !S.drawer; if (S.drawer) { renderDrawer(); pollStatus(); } }
 $("#drawer-close").onclick = () => toggleDrawer(false);
 $$("#tabs button").forEach((b) => b.addEventListener("click", () => { S.tab = b.dataset.tab; renderDrawer(); }));
@@ -1701,6 +1704,7 @@ function renderDrawer() {
   $$("[data-rain]", body).forEach((b) => b.addEventListener("click", async () => {
     $$("[data-rain]", body).forEach((x) => (x.disabled = true)); b.querySelector("i") ? (b.querySelector("i").textContent = "Starting…") : (b.textContent = "Switching…");
     await setRain(b.dataset.rain);
+    S.drawerTouch = 0; await pollStatus();
   }));
   $$("[data-act]", body).forEach((b) => b.addEventListener("click", () => act(b.dataset.act, b)));
 }
@@ -1771,7 +1775,8 @@ let statusTimer = null;
 async function pollStatus() {
   clearTimeout(statusTimer);
   const r = await api("/api/status");
-  if (r.ok) { S.status = r.j; if (S.drawer && S.tab === "system") renderDrawer(); }
+  // never re-render under someone's finger: a click mid-refresh would be lost
+  if (r.ok) { S.status = r.j; if (S.drawer && S.tab === "system" && performance.now() - (S.drawerTouch || 0) > 4000) renderDrawer(); }
   statusTimer = setTimeout(pollStatus, S.drawer ? 3000 : 20000);
 }
 setInterval(async () => {  // background loading progress for the home sheet
