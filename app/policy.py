@@ -20,12 +20,19 @@ USERS = {
 
 
 class Policy:
-    def __init__(self, localities):
+    def __init__(self, localities=()):
         self.text = POLICY_FILE.read_text()
         self.ids = re.findall(r'@id\("([^"]+)"\)', self.text)
-        self.localities = localities
-        USERS["ravi"]["locality"] = localities[min(1, len(localities) - 1)] if localities else "Area"
-        USERS["ravi"]["desc"] = f"Ward officer · {USERS['ravi']['locality']}"
+        self.refresh(list(localities))
+
+    def refresh(self, localities, ravi_locality=None):
+        """Localities come from the tiles around you, so the entity set follows the map."""
+        self.localities = list(dict.fromkeys(localities)) or ["Area"]
+        loc = ravi_locality or USERS["ravi"].get("locality")
+        if loc not in self.localities:
+            loc = self.localities[min(1, len(self.localities) - 1)]
+        USERS["ravi"]["locality"] = loc
+        USERS["ravi"]["desc"] = f"Ward officer · {loc}"
         self.entities = self._entities()
 
     def _entities(self):
