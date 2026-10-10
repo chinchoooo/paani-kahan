@@ -17,7 +17,7 @@ make up                 # or: finch compose up --build -d   (docker compose work
 open http://localhost:8080
 ```
 
-The map opens straight away. The base map (OpenStreetMap, drawn by CARTO) comes straight from a CDN, so there is always a full, labelled map whatever the server is doing. The flood forecast is drawn on top of it as streets load around you in the background:
+The map opens straight away. The base map (OpenStreetMap's own tiles, no API key, shown in black and white) comes straight from openstreetmap.org, so there is always a full, labelled map whatever the server is doing. The flood forecast is drawn on top of it as streets load around you in the background:
 
 - **every street within 10 km**, nearest first;
 - **main roads and terrain for 100 km**;
@@ -230,7 +230,7 @@ Copy `.env.example` to `.env`. Everything is optional.
 | `CPU_WORKERS` | `3` | flood-model threads |
 | `DATA_SOURCE` | `osm` | `synthetic` = invented streets that work fully offline (labelled) |
 | `MODEL_PROVIDER` / `OLLAMA_MODEL` / `ANTHROPIC_API_KEY` | `ollama` / `llama3.2:3b` | the agent's model |
-| `BASEMAP` | `carto` | `carto` (Positron / Dark Matter), `osm` (openstreetmap.org tiles), `none`, or your own `https://…/{z}/{x}/{y}.png` template |
+| `BASEMAP` | `osm` | `osm` (OpenStreetMap tiles in black and white, no key), `osm-color`, `carto` (needs `CARTO_API_KEY`), `none`, or your own `https://…/{z}/{x}/{y}.png` template |
 | `TOMTOM_API_KEY` | | live closures and flooding from TomTom |
 | `LIVE_REFRESH_MIN` | `15` | live rain refresh |
 | `DEMO_NOW` | `16:10` | the clock in demo-storm mode |
@@ -257,4 +257,4 @@ Copy `.env.example` to `.env`. Everything is optional.
 
 ## Data and licences
 
-Base map: © OpenStreetMap contributors, © CARTO (attribution shown on the map). Streets, water bodies, localities and facilities: © OpenStreetMap contributors (ODbL). Elevation: Terrain Tiles, AWS Registry of Open Data (SRTM, public domain). Rain: Open-Meteo (CC BY 4.0), ERA5 (Copernicus). Font: Inter Tight (SIL OFL) via Google Fonts.
+Base map: © OpenStreetMap contributors (attribution shown on the map). Streets, water bodies, localities and facilities: © OpenStreetMap contributors (ODbL). Elevation: Terrain Tiles, AWS Registry of Open Data (SRTM, public domain). Rain: Open-Meteo (CC BY 4.0), ERA5 (Copernicus). Font: Inter Tight (SIL OFL) via Google Fonts.

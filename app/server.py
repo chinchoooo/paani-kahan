@@ -247,22 +247,29 @@ app.mount("/static", StaticFiles(directory=WEB), name="static")
 
 
 # ------------------------------------------------------------------ world
+# Raster base maps that need no API key. OpenStreetMap's own tiles are shown in black and
+# white by the client (canvas filters), so the map stays bold and minimal in both themes.
+BW = {"light": "grayscale(1) contrast(1.05) brightness(1.06)", "dark": "invert(1) grayscale(1) brightness(2.4) contrast(0.95)"}
 BASEMAPS = {
-    "carto": {"light": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-              "dark": "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-              "subdomains": "abcd", "attribution": "© OpenStreetMap contributors © CARTO", "maxZoom": 19},
     "osm": {"light": "https://tile.openstreetmap.org/{z}/{x}/{y}.png", "dark": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-            "subdomains": "", "attribution": "© OpenStreetMap contributors", "maxZoom": 19},
+            "subdomains": "", "attribution": "© OpenStreetMap contributors", "maxZoom": 19, "filter": BW},
+    "osm-color": {"light": "https://tile.openstreetmap.org/{z}/{x}/{y}.png", "dark": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                  "subdomains": "", "attribution": "© OpenStreetMap contributors", "maxZoom": 19, "filter": None},
+    # needs a CARTO key since 2026: BASEMAP=carto and CARTO_API_KEY=...
+    "carto": {"light": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png?api_key=" + os.getenv("CARTO_API_KEY", ""),
+              "dark": "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?api_key=" + os.getenv("CARTO_API_KEY", ""),
+              "subdomains": "abcd", "attribution": "© OpenStreetMap contributors © CARTO", "maxZoom": 19, "filter": None},
 }
 
 
 def basemap():
-    v = os.getenv("BASEMAP", "carto").strip()
+    v = os.getenv("BASEMAP", "osm").strip()
     if v == "none":
         return None
     if v.startswith("http"):  # a custom XYZ template
-        return {"light": v, "dark": v, "subdomains": "", "attribution": os.getenv("BASEMAP_ATTRIBUTION", "© OpenStreetMap contributors"), "maxZoom": 19}
-    return BASEMAPS.get(v, BASEMAPS["carto"])
+        return {"light": v, "dark": v, "subdomains": "", "attribution": os.getenv("BASEMAP_ATTRIBUTION", "© OpenStreetMap contributors"), "maxZoom": 19,
+                "filter": BW if os.getenv("BASEMAP_BW", "1") == "1" else None}
+    return BASEMAPS.get(v, BASEMAPS["osm"])
 
 
 @app.get("/api/world")

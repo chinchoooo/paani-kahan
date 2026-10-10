@@ -142,9 +142,11 @@ function tileBBox(z, x, y) {
 /* ------------------------------------------------------------- basemap */
 // A raster basemap (CARTO Positron / Dark Matter, from OpenStreetMap) that loads straight from a CDN,
 // independent of our server. Whatever state the flood data is in, there is always a real map.
+const BW_FILTER = { light: "grayscale(1) contrast(1.05) brightness(1.06)", dark: "invert(1) grayscale(1) brightness(2.4) contrast(0.95)" };
 const BASE = {
-  cfg: { light: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", dark: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-    subdomains: "abcd", attribution: "© OpenStreetMap contributors © CARTO", maxZoom: 19 },
+  // OpenStreetMap's own tiles: no API key. Shown in black and white (filtered once per tile, then cached).
+  cfg: { light: "https://tile.openstreetmap.org/{z}/{x}/{y}.png", dark: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    subdomains: "", attribution: "© OpenStreetMap contributors", maxZoom: 19, filter: BW_FILTER },
   imgs: new Map(), loaded: 0, failed: 0, inflight: 0,
 };
 const baseOK = () => !!BASE.cfg && (BASE.loaded > 0 || BASE.failed < 6);
@@ -155,9 +157,9 @@ function baseUrl(z, x, y) {
 function baseImg(z, x, y, load) {
   const url = baseUrl(z, x, y);
   let e = BASE.imgs.get(url);
-  if (!e && load && BASE.inflight < 16) {
+  if (!e && load && BASE.inflight < 12) {
     const img = new Image();
-    e = { img, ok: false, used: 0 };
+    e = { img, ok: false, used: 0, cv: null, cvKey: null };
     BASE.inflight++;
     img.onload = () => { e.ok = true; BASE.loaded++; BASE.inflight--; };
     img.onerror = () => { e.bad = true; BASE.failed++; BASE.inflight--; setTimeout(() => BASE.imgs.delete(url), 15000); };
@@ -168,8 +170,18 @@ function baseImg(z, x, y, load) {
       for (const [u] of old) BASE.imgs.delete(u);
     }
   }
-  if (e) e.used = performance.now();
-  return e && e.ok ? e.img : null;
+  if (!e || !e.ok) return null;
+  e.used = performance.now();
+  const f = BASE.cfg.filter && BASE.cfg.filter[T.dark ? "dark" : "light"];
+  if (!f || !("filter" in ctx)) return e.img;
+  if (e.cvKey !== f) {  // filter once, reuse every frame
+    const c = e.cv || document.createElement("canvas");
+    c.width = e.img.naturalWidth; c.height = e.img.naturalHeight;
+    const cx = c.getContext("2d");
+    cx.filter = f; cx.drawImage(e.img, 0, 0); cx.filter = "none";
+    e.cv = c; e.cvKey = f;
+  }
+  return e.cv;
 }
 function drawBasemap() {
   if (!BASE.cfg) return;
@@ -188,7 +200,7 @@ function drawBasemap() {
     for (let up = 1; up <= 6 && z - up >= 0; up++) {
       const az = z - up, ax_ = tx >> up, ay_ = ty >> up, a = baseImg(az, ax_, ay_, up === 1);
       if (!a) continue;
-      const span = 2 ** up, sw = a.naturalWidth / span, sx = (tx - (ax_ << up)) * sw, sy = (ty - (ay_ << up)) * sw;
+      const span = 2 ** up, sw = (a.naturalWidth || a.width) / span, sx = (tx - (ax_ << up)) * sw, sy = (ty - (ay_ << up)) * sw;
       ctx.drawImage(a, sx, sy, sw, sw, px0, py0, px1 - px0, py1 - py0);
       break;
     }
@@ -1905,7 +1917,7 @@ async function boot() {
   let w = await api("/api/world");
   while (!w.ok) { await new Promise((r) => setTimeout(r, 1500)); w = await api("/api/world"); }
   S.cfg = w.j;
-  if (w.j.basemap !== undefined) BASE.cfg = w.j.basemap;
+  if (w.j.basemap !== undefined && JSON.stringify(w.j.basemap) !== JSON.stringify(BASE.cfg)) { BASE.cfg = w.j.basemap; BASE.imgs.clear(); BASE.loaded = 0; BASE.failed = 0; }
   if (BASE.cfg) $("#attrib").textContent = BASE.cfg.attribution;
   if (!prefs.last) { setOrigin(...S.cfg.origin); centreOn(0, 0, 0.25, 0); }
   centreOn(0, 0, 0.4, 1200);

@@ -10,7 +10,7 @@ const V = "__V__";
 const SHELL = `pk-shell-${V}`;
 const DATA = "pk-data-v3";
 const TERRAIN = "pk-terrain-v1";
-const BASEMAP = "pk-basemap-v1";
+const BASEMAP = "pk-basemap-v2";
 const BASE_HOSTS = ["basemaps.cartocdn.com", "tile.openstreetmap.org"];
 let basePuts = 0;
 const SHELL_URLS = ["/", "/static/app.js?v=" + V, "/static/app.css?v=" + V, "/manifest.webmanifest",
@@ -23,7 +23,7 @@ self.addEventListener("install", (e) => {
 
 self.addEventListener("activate", (e) => {
   e.waitUntil((async () => {
-    for (const k of await caches.keys()) if ((k.startsWith("pk-shell-") && k !== SHELL) || k === "pk-data-v1") await caches.delete(k);
+    for (const k of await caches.keys()) if ((k.startsWith("pk-shell-") && k !== SHELL) || k === "pk-data-v1" || k === "pk-basemap-v1") await caches.delete(k);
     await self.clients.claim();
   })());
 });
