@@ -1,0 +1,75 @@
+# Works with both:  finch compose up --build   and   docker compose up --build
+name: paani-kahan
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.17.1
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - bootstrap.memory_lock=false
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+    ports: ["9200:9200"]
+    volumes: [osdata:/usr/share/opensearch/data]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  dashboards:            # optional: finch compose --profile dashboards up
+    image: opensearchproject/opensearch-dashboards:2.17.1
+    profiles: [dashboards]
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports: ["5601:5601"]
+    depends_on: [opensearch]
+
+  tunnel:                # phone link over HTTPS: finch compose --profile phone up -d
+    image: cloudflare/cloudflared:2024.8.3
+    profiles: [phone]
+    command: tunnel --no-autoupdate --metrics 0.0.0.0:2000 --url http://app:8080
+    depends_on: [app]
+
+  localstack:
+    image: localstack/localstack:3.8.1
+    environment:
+      - SERVICES=sns,sqs
+      - DEBUG=0
+    ports: ["4566:4566"]
+    volumes:
+      - ./localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh
+
+  app:
+    build: .
+    ports: ["8080:8080"]
+    environment:
+      - OPENSEARCH_URL=http://opensearch:9200
+      - LOCALSTACK_URL=http://localstack:4566
+      - MODEL_PROVIDER=${MODEL_PROVIDER:-ollama}
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:3b}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - AREA=${AREA:-}
+      - RAIN_SOURCE=${RAIN_SOURCE:-live}
+      - LIVE_REFRESH_MIN=${LIVE_REFRESH_MIN:-15}
+      - TOMTOM_API_KEY=${TOMTOM_API_KEY:-}
+      - PHONE_LAN_URL=${PHONE_LAN_URL:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      localstack:
+        condition: service_started
+
+volumes:
+  osdata:
+
+networks:
+  default:
+    name: paani-net
