@@ -1,39 +1,40 @@
-"""Pick a demo commute for an area.
+"""Pick the demo commute on the streets where you are.
 
 The demo needs one commute where the 4:10 PM nowcast says 'watch', the updated
-nowcast says 'flooded', and a dry route exists. We search candidate trips across
-the area and keep the best one. This is run once when an area is prepared.
+nowcast says 'flooded', and a dry route exists. We search candidate trips across the
+tiles around you and keep the best one.
 """
 from __future__ import annotations
 
 import random
 
-from .rain import RainModel
 from .routing import LIMIT_CM
 
 DEPART = 110  # 6:00 PM, minutes after the 4:10 PM 'now'
 
 
-def pick_story(area, model, router, tries=700, seed=3):
+def pick_story(router, sim0, sim1, locality_of, center=None, tries=900, seed=3):
     rng = random.Random(seed)
-    sims = [model.simulate(RainModel(*area.dem.shape, area.cell_m, version=v), f"story{v}") for v in (0, 1)]
     nodes = router.node_ids
+    area = router.area
+    if center:  # prefer trips that start and end near the middle of the map
+        nodes = sorted(nodes, key=lambda n: area.dist_m(area.nodes[n], center))[: max(400, len(nodes) // 3)]
     best, best_score = None, -1e9
     mode = "two_wheeler"
     lim = LIMIT_CM[mode]
     found = 0
     for k in range(tries):
-        if found >= 3 and k > 150:
+        if found >= 3 and k > 200:
             break
         a, b = rng.choice(nodes), rng.choice(nodes)
         pa, pb = area.nodes[a], area.nodes[b]
         dist = area.dist_m(pa, pb)
-        if not 2800 < dist < 5000:
+        if not 2600 < dist < 5200:
             continue
         try:
-            p0 = router.plan(pa, pb, mode, DEPART, sims[0])
-            p1 = router.plan(pa, pb, mode, DEPART, sims[1])
-        except Exception:
+            p0 = router.plan(pa, pb, mode, DEPART, sim0)
+            p1 = router.plan(pa, pb, mode, DEPART, sim1)
+        except Exception:  # noqa: BLE001
             continue
         d0, d1 = p0["usual"]["max_depth"], p1["usual"]["max_depth"]
         if not p1["dry"]:
@@ -56,7 +57,7 @@ def pick_story(area, model, router, tries=700, seed=3):
     pa, pb, d0, d1, dd = best
     return {
         "name": "Priya", "mode": mode, "depart_min": DEPART, "depart_label": "6:00 PM",
-        "from": list(pa), "from_label": area.locality_of(*pa),
-        "to": list(pb), "to_label": area.locality_of(*pb),
-        "check": {"v0_cm": d0, "v1_cm": d1, "dry_cm": dd},
+        "from": list(pa), "from_label": locality_of(*pa),
+        "to": list(pb), "to_label": locality_of(*pb),
+        "check": {"v0_cm": d0, "v1_cm": d1, "dry_cm": dd, "full_story": best_score > 500},
     }
