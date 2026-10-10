@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<title>Paani Kahan</title>
+<meta name="description" content="Which streets will flood in the next 6 hours, and a dry route home.">
+<meta name="theme-color" content="#0b1215" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#eef1ef" media="(prefers-color-scheme: light)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/static/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icons/apple-180.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="/static/app.css?v=__V__">
+</head>
+<body>
+<canvas id="map" aria-label="Flood forecast map. Drag to pan, scroll or pinch to zoom, tap a street for details."></canvas>
+
+<div id="boot"><div class="boot-mark"><span class="drop"></span>Paani Kahan</div><ol id="boot-log"></ol></div>
+
+<!-- search + chips -->
+<header class="top" id="top">
+  <div class="search" id="search">
+    <button class="s-ic" id="s-back" aria-label="Back" hidden><svg viewBox="0 0 24 24"><path d="M15 5 8 12l7 7"/></svg></button>
+    <span class="s-ic brand" id="s-brand" aria-hidden="true"><span class="drop"></span></span>
+    <input id="q" type="search" placeholder="Search streets and places" autocomplete="off" enterkeyhint="search" aria-label="Search streets and places">
+    <button class="s-ic" id="q-clear" aria-label="Clear" hidden><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+    <button class="avatar" id="avatar" aria-haspopup="menu" aria-expanded="false" aria-label="Account and settings">P</button>
+  </div>
+  <div class="sugg" id="sugg" role="listbox" hidden></div>
+  <div class="chips" id="chips" role="group" aria-label="Map layers">
+    <button class="chip on" data-layer="flood" aria-pressed="true"><i class="sw flood"></i>Flood depth</button>
+    <button class="chip on" data-layer="rain" aria-pressed="true"><i class="sw rain"></i>Rain</button>
+    <button class="chip on" data-layer="closures" aria-pressed="true"><i class="sw closures"></i>Closures</button>
+    <button class="chip" data-layer="sites" aria-pressed="false"><i class="sw sites"></i>Hospitals &amp; schools</button>
+    <span class="chip info" id="offline" hidden></span>
+  </div>
+</header>
+<div class="menu" id="menu" role="menu" hidden></div>
+<div class="notice" id="notice" hidden></div>
+
+<!-- map controls -->
+<div class="ctrls" id="ctrls">
+  <button class="ctl" id="report" aria-label="Report water here" title="Report water here"><svg viewBox="0 0 24 24"><path d="M12 3s6 7.3 6 11a6 6 0 0 1-12 0c0-3.7 6-11 6-11z"/><path d="M12 11v6M9 14h6"/></svg></button>
+  <button class="ctl" id="locate" aria-label="Show my location"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/><circle class="fill" cx="12" cy="12" r="2.6"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></button>
+  <div class="ctl-grp"><button class="ctl" id="zin" aria-label="Zoom in"><svg viewBox="0 0 24 24"><path d="M12 6v12M6 12h12"/></svg></button><button class="ctl" id="zout" aria-label="Zoom out"><svg viewBox="0 0 24 24"><path d="M6 12h12"/></svg></button></div>
+</div>
+
+<!-- forecast timeline -->
+<section class="timeline" id="timeline" aria-label="Forecast timeline">
+  <button class="play" id="play" aria-label="Play the next 6 hours"><svg viewBox="0 0 16 16"><path id="play-ico" d="M4.5 2.8v10.4l8.5-5.2z"/></svg></button>
+  <div class="tl">
+    <div class="tl-row"><span class="tl-t"><b id="tl-time">Now</b><span id="tl-sub"></span></span><span class="tl-rain num" id="tl-rain"></span></div>
+    <div class="track" id="track" role="slider" tabindex="0" aria-label="Forecast time" aria-valuemin="0" aria-valuemax="360">
+      <canvas id="hyeto"></canvas><span class="depart" id="depart-mark" hidden></span><span class="head" id="head"></span>
+    </div>
+  </div>
+</section>
+
+<!-- bottom sheet / side panel -->
+<section class="sheet" id="sheet" aria-label="Details">
+  <div class="grab" id="grab" aria-hidden="true"><i></i></div>
+  <div class="sheet-body" id="sheet-body"></div>
+</section>
+
+<div class="tip" id="tip" hidden></div>
+<div class="toast" id="toast" role="alert" hidden></div>
+<div class="snack" id="snack" hidden></div>
+
+<aside class="drawer" id="drawer" aria-label="How it works" hidden>
+  <div class="d-top"><b>How it works</b><button class="s-ic" id="drawer-close" aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+  <nav class="tabs" id="tabs"><button data-tab="why" class="on">Agent</button><button data-tab="ops">Ops</button><button data-tab="system">System</button></nav>
+  <div class="tab-body" id="tab-body"></div>
+</aside>
+
+<script src="/static/app.js?v=__V__"></script>
+</body>
+</html>
