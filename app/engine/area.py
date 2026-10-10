@@ -15,7 +15,8 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+import os
+DATA_DIR = Path(os.getenv("PK_DATA_DIR") or Path(__file__).resolve().parents[2] / "data")
 
 M_PER_DEG_LAT = 110_574.0
 
@@ -41,6 +42,7 @@ class Segment:
     underpass: bool = False          # subways: the first places to flood in Chennai
     construction: bool = False       # roads under construction (closed)
     nodes: list = field(default_factory=list)
+    gid: str = ""                    # global id across tiles: "<z>/<x>/<y>:<idx>"
 
     @property
     def mid(self):
@@ -68,7 +70,10 @@ class Area:
 
     @property
     def m_per_deg_lon(self):
-        return 111_320.0 * math.cos(math.radians(self.lat0))
+        v = self.__dict__.get("_mlon")
+        if v is None:
+            v = self.__dict__["_mlon"] = 111_320.0 * math.cos(math.radians(self.lat0))
+        return v
 
     def dist_m(self, a, b):
         dy = (a[0] - b[0]) * M_PER_DEG_LAT
@@ -138,48 +143,66 @@ def _split_ways(nodes: dict, ways: list):
 
 
 def load_area(area_id: str | None = None) -> Area:
-    if area_id is None:
-        active = DATA_DIR / "ACTIVE"  # written when someone builds the forecast for their own location
-        if active.exists() and (DATA_DIR / active.read_text().strip() / "area.json").exists():
-            area_id = active.read_text().strip()
-        else:
-            area_id = "velachery" if (DATA_DIR / "velachery" / "area.json").exists() else "sample"
+    """Legacy single-area loader (data/<area_id>/), used by scripts and tests."""
+    area_id = area_id or "sample"
     d = DATA_DIR / area_id
     if not (d / "area.json").exists():
         if area_id != "sample":
-            raise FileNotFoundError(f"No area data in {d}. Run: python scripts/fetch_area.py")
+            raise FileNotFoundError(f"No area data in {d}")
         from .sample import make_sample
         make_sample(d)
     meta = json.loads((d / "area.json").read_text())
     dem = np.load(d / "dem.npy").astype(np.float32)
     streets = json.loads((d / "streets.json").read_text())
+    return build_area(area_id, meta, dem, streets)
+
+
+def build_area(area_id: str, meta: dict, dem: np.ndarray, streets: dict, owner_bbox=None, gid_prefix=None) -> Area:
+    """Turn streets + terrain into an Area. With owner_bbox, keep only the street segments
+    whose midpoint lies in that box: neighbouring tiles fetch the same OSM ways, and this
+    gives every segment exactly one owner, so tiles join without duplicates or gaps."""
     nodes = {str(k): tuple(v) for k, v in streets["nodes"].items()}
     ways = [{**w, "nodes": [str(n) for n in w["nodes"]]} for w in streets["ways"]]
     area = Area(area_id=area_id, meta=meta, dem=dem, nodes=nodes)
-
     rows, cols = dem.shape
     area.barriers = {str(k): v for k, v in (streets.get("barriers") or {}).items()}
+    s, w, n, e = area.bbox
+    mlon = area.m_per_deg_lon
     for part, name, hw, bridge, tunnel, construction in _split_ways(nodes, ways):
-        coords = [list(nodes[n]) for n in part]
-        length = sum(area.dist_m(coords[i], coords[i + 1]) for i in range(len(coords) - 1))
+        coords = [list(nodes[nid]) for nid in part]
+        mid = coords[len(coords) // 2]
+        if owner_bbox and not (owner_bbox[0] <= mid[0] < owner_bbox[2] and owner_bbox[1] <= mid[1] < owner_bbox[3]):
+            continue
+        a = np.array(coords, dtype=float)
+        seglen = np.hypot(np.diff(a[:, 0]) * M_PER_DEG_LAT, np.diff(a[:, 1]) * mlon)
+        length = float(seglen.sum())
         if length < 3:
             continue
-        seg = Segment(idx=len(area.segments), u=part[0], v=part[-1], coords=coords,
+        idx = len(area.segments)
+        seg = Segment(idx=idx, u=part[0], v=part[-1], coords=coords,
                       name=name, highway=hw, length_m=length, bridge=bridge, underpass=tunnel,
                       construction=construction, nodes=part)
-        # sample grid cells every ~8 m along the polyline
-        cells = []
-        for i in range(len(coords) - 1):
-            a, b = coords[i], coords[i + 1]
-            n = max(1, int(area.dist_m(a, b) / 8))
-            for k in range(n + 1):
-                t = k / n
-                r, c = area.latlon_to_cell(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
-                cells.append(r * cols + c)
-        seg.cells = np.unique(np.array(cells, dtype=np.int64))
-        m = seg.mid
-        seg.locality = area.locality_of(m[0], m[1])
+        # sample grid cells every ~8 m along the polyline (vectorised)
+        k = np.maximum(1, (seglen / 8).astype(np.int64))
+        rep = np.repeat(np.arange(len(seglen)), k)
+        t = (np.arange(len(rep)) - np.repeat(np.cumsum(k) - k, k) + 1) / np.repeat(k, k)
+        p = np.concatenate([a[:1], a[rep] + (a[rep + 1] - a[rep]) * t[:, None]])
+        r = np.clip(((n - p[:, 0]) / (n - s) * rows).astype(np.int64), 0, rows - 1)
+        c = np.clip(((p[:, 1] - w) / (e - w) * cols).astype(np.int64), 0, cols - 1)
+        seg.cells = np.unique(r * cols + c)
         if not seg.name:
             seg.name = f"Unnamed {hw.replace('_', ' ')} road"
+        if gid_prefix:
+            seg.gid = f"{gid_prefix}:{idx}"
         area.segments.append(seg)
+    locs = meta.get("localities") or []
+    if locs and area.segments:
+        pts = np.array([[L["lat"] * M_PER_DEG_LAT, L["lon"] * mlon] for L in locs])
+        q = np.array([[sg.mid[0] * M_PER_DEG_LAT, sg.mid[1] * mlon] for sg in area.segments])
+        _, li = cKDTree(pts).query(q)
+        for sg, i in zip(area.segments, li):
+            sg.locality = locs[int(i)]["name"]
+    else:
+        for sg in area.segments:
+            sg.locality = "Area"
     return area
