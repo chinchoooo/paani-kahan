@@ -1,0 +1,4 @@
+**/__pycache__
+.aws-sam
+.git
+*.zip
