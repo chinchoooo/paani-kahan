@@ -14,9 +14,10 @@ The story: **Priya rides home at 6 PM. At 4:10 her route is fine. At 4:25 a new 
 ## Setup (30 minutes before recording)
 
 ```bash
-make up && make data          # real Velachery; wait for "Ready" in: make logs
-# then in the app: How it works → System → Rain data → Demo storm  (live rain is unpredictable; record the story on the demo storm)
+make up
+make warm                     # pre-load Velachery (or LAT=.. LON=.. for where you'll record) so nothing loads on camera
 make model                    # ollama pull llama3.2:3b, and keep Ollama running
+# in the app: How it works → System → Demo storm here   (centred on the map / your location; wait for the demo commute)
 make reset                    # back to the 4:10 PM nowcast
 ```
 
@@ -24,7 +25,7 @@ Then:
 
 1. Open `http://localhost:8080` in Chrome at **1440 × 900** (DevTools device toolbar, or a window that size). Zoom 100%. Hide bookmarks bar. Use a guest profile so no personal tabs or autofill show.
 2. Account menu → **How it works** → System: check OpenSearch says *connected*, the agent says *ready*, and alerts say *LocalStack SNS → SQS*. Fix anything else first (README → Troubleshooting).
-3. Pick your story numbers: on the **Home at 6:00 PM** row, note the 6:00 PM depth now (4:10 nowcast) and after `make tick`. Run `make tick` once to rehearse, then `make reset`. Write the street name and both depths on a sticky note for the voiceover.
+3. Pick your story numbers: on the **Home at 6:00 PM** row, note the 6:00 PM depth now (4:10 nowcast) and after `make tick`. Run `make tick` once to rehearse, then `make reset`. Write the street name and both depths on a sticky note for the voiceover. (The demo commute is chosen on your streets so this always works: Watch at 4:10, Flooded after the update, with a dry route.)
 4. Warm the agent: open the commute directions once so Ollama has the model loaded (the first call is slow).
 5. Terminal for the split screen: large font (18 pt+), dark theme, `cd serverless`, clear history.
 6. Phone or second browser window signed into Google Maps for the handoff shot (optional but strong).
@@ -40,21 +41,23 @@ Record on a laptop at 1440 × 900 (dark theme looks best on video), and grab two
 | # | Time | On screen | Voiceover |
 |---|---|---|---|
 | 1 | 0:00 – 0:09 | Black. White text, one line at a time: *"July 9, 2026. Surat: 9 dead, 3,400 rescued."* / *"Delhi: streets underwater, a building down in Rohini."* / *"Every monsoon, the same streets flood. Every time, it's a surprise."* | "Every monsoon, the same streets flood." |
-| 2 | 0:09 – 0:20 | The app opens: the boot lines tick, the map draws in, and the blue dot finds you. | "This is Velachery in Chennai. Every street from OpenStreetMap, on real terrain from AWS open data. We forecast how deep the water will be on each one." |
+| 2 | 0:09 – 0:20 | The app opens straight onto the map; streets fade in tile by tile and the blue dot finds you. Zoom out once: main roads for 100 km. | "Open it anywhere. Every street around you from OpenStreetMap, main roads for a hundred kilometres, on real terrain from AWS open data, loaded in the background. We forecast how deep the water will get on each one." |
 | 3 | 0:20 – 0:40 | Press **Space**. The rain sweeps in; streets turn blue, then amber, then red; the timeline fills. Scrub back to 6:00. | "Every ten minutes, six hours ahead. Rain the drains can't take runs downhill, fills the low spots, and spills over. Red means too deep to cross." |
 | 4 | 0:40 – 0:55 | Type a street in the search bar: results show their depth. Tap one: the sheet shows its depth curve and past reports, labelled OpenSearch. | "Search any street. It shows how deep it'll get and when, and what residents reported there before, searched by text and location in OpenSearch." |
 | 5 | 0:55 – 1:22 | Tap **Home at 6:00 PM**: directions, Clear. **Split screen:** terminal runs `sam local invoke PollerFunction` → `published alert for priya`. The notification drops in ("via LocalStack SNS → SQS"); the route turns red, the green dry route appears. | "Priya rides home at six. At 4:10 her route is clear. At 4:25 a new nowcast lands. A Lambda built with SAM re-runs the forecast and publishes to SNS; on LocalStack it fans out to SQS, and the alert reaches her before she leaves." |
 | 6 | 1:22 – 1:40 | Tap **why?**: the agent's tool calls: `check_route`, `flood_history`, `best_departure`. | "The advice is written by an agent built with the Strands Agents SDK. Every number comes from a tool call." |
 | 7 | 1:40 – 1:58 | Tap **Start in Google Maps**. Cut to Google Maps on a phone with the route through the waypoints. | "Then it gets out of the way. One tap and she's navigating in Google Maps, on a route that stays dry." |
-| 8 | 1:58 – 2:15 | Phone: search a town 60–100 km away → **Build trip forecast** → the corridor appears with its main roads, the route checked at the time you reach each stretch. | "Going further? It builds a forecast for the whole corridor, and checks each stretch for when you'll actually get there." |
+| 8 | 1:58 – 2:15 | Phone: search a town 60–100 km away (Kanchipuram, Mahabalipuram) → directions straight away: main roads checked along the way, every street at both ends. | "Going further? The main roads for a hundred kilometres are already loaded, so it checks each stretch for when you'll actually get there." |
 | 9 | 2:15 – 2:35 | Account menu → **Ravi**: his ward only, others hidden by policy. **Control room**: hospitals and schools losing access pulse on the map. Tap the Hospitals chip as Priya: *Restricted layer*. Flash `paani.cedar`. | "The people who fix floods see something different, and every request is checked by Cedar policies. Who sees what is a policy edit, not a code change." |
 | 10 | 2:35 – 2:50 | Terminal: `finch compose up`. Then the phone: installed app icon, opening offline. End card: **Paani Kahan** / *"You keep using Google Maps. We make sure it doesn't send you into a flood."* | "It runs on a laptop with Finch, installs on your phone, and works offline." |
 
-**Optional live beat (10 s, between shots 7 and 8):** switch Rain data to *Live*, show "Live · Open-Meteo 15-min · updated 5:07 PM", tap **Report water**, choose *Knee*, and the street turns red on the map. Say: "In live mode it uses the real forecast, refreshed every 15 minutes, and anyone can report water; their reports correct the forecast nearby." Say it was switched on; never imply the demo storm was real.
+**Optional live beat (10 s, between shots 7 and 8):** switch Rain to *Live*, show "Live · Open-Meteo 15-min · updated 5:07 PM", tap **Report water**, choose *Knee*, and the street turns red on the map. Say: "In live mode it uses the real forecast, refreshed every 15 minutes, and anyone can report water; their reports correct the forecast nearby." Say it was switched on; never imply the demo storm was real. (The blue DEMO STORM badge is on screen in demo mode; keep it in frame.)
+
+**Optional systems beat (8 s):** How it works → System: the tile grid filling in, the upstreams (OpenStreetMap, AWS Terrain Tiles, Open-Meteo) with call counts, the OpenSearch query log. Say: "Everything loads by priority in the background: what you're looking at first, your route next, then a hundred kilometres around you."
 
 **Optional Chennai beat (10 s):** How it works → System → replay **Cyclone Michaung**. Say: "This is the recorded rain from Cyclone Michaung, replayed on today's streets." Tap a subway: *likely closed*.
 
-If time is tight, cut shot 8 (long trips) first; it needs a network connection and a minute to build.
+If time is tight, cut shot 8 (long trips) first. Search the destination once before recording so its tiles are cached.
 
 Voiceover is about 320 words: comfortable at a normal pace with room to breathe.
 
@@ -76,5 +79,6 @@ Voiceover is about 320 words: comfortable at a normal pace with room to breathe.
 | Agent dot amber / card says "Template" | `ollama serve`, `make model`, reload. If it still fails, record with the template and say "the advice" rather than "the agent" in shot 5, and skip shot 6. |
 | `sam` not installed | `make tick-py` runs the same handler without SAM. Then say "a Lambda function" and don't show the SAM command. Better: install SAM CLI, it takes two minutes. |
 | LocalStack dot amber | `finch compose restart localstack`, wait 10 s. The app re-wires SNS → SQS by itself. |
-| The story numbers are weak on your area (depth barely changes) | Delete `"persona"` from `data/velachery/area.json` (set it to `null`) and restart; a new commute is chosen. Or set `DEMO_NOW` / pick a different departure chip. |
+| The story numbers are weak where you are | Pan a few km and press **Demo storm here** again; a new commute is chosen on those streets. |
+| Streets still loading on camera | Run `make warm` for that spot first (or just open the app there once); tiles are cached on disk. |
 | Need to redo a take | `make reset` returns to 4:10 PM in about a second. |
