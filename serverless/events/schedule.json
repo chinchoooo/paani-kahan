@@ -1,0 +1,11 @@
+{
+  "version": "0",
+  "id": "paani-demo-tick",
+  "detail-type": "Scheduled Event",
+  "source": "aws.events",
+  "account": "000000000000",
+  "time": "2026-10-10T10:40:00Z",
+  "region": "us-east-1",
+  "resources": ["arn:aws:events:us-east-1:000000000000:rule/paani-nowcast-every-15-min"],
+  "detail": {}
+}

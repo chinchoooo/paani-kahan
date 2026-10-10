@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Paani Kahan nowcast poller. Every 15 minutes: re-run the street flood forecast with
+  the latest rainfall nowcast, then publish commute alerts to SNS.
+  Locally: `sam build && sam local invoke PollerFunction` against LocalStack.
+
+Parameters:
+  AppUrl:
+    Type: String
+    Default: http://app:8080
+  AwsEndpoint:
+    Type: String
+    Default: http://localstack:4566
+    Description: Empty string in real AWS; the LocalStack URL locally.
+
+Resources:
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: paani-alerts
+
+  PollerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: paani-nowcast-poller
+      CodeUri: poller/
+      Handler: app.handler
+      Runtime: python3.12
+      Timeout: 90
+      MemorySize: 256
+      Environment:
+        Variables:
+          APP_URL: !Ref AppUrl
+          AWS_ENDPOINT: !Ref AwsEndpoint
+          ALERTS_TOPIC_NAME: paani-alerts
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertsTopic.TopicName
+      Events:
+        Every15Minutes:
+          Type: Schedule
+          Properties:
+            Schedule: rate(15 minutes)
+            Name: paani-nowcast-every-15-min
+
+Outputs:
+  PollerFunctionName:
+    Value: !Ref PollerFunction
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
