@@ -82,6 +82,34 @@ def forecast(qs):
     return out[0] if len(out) == 1 else out
 
 
+def basemap(z, x, y):
+    """A stand-in for CARTO Positron: the synthetic world's roads drawn in the real tile scheme."""
+    from PIL import ImageDraw
+    n = 2 ** z
+    img = Image.new("RGB", (256, 256), (242, 242, 240))
+    d = ImageDraw.Draw(img)
+
+    def px(la, lo):
+        fx = (lo + 180) / 360 * n
+        fy = (1 - math.asinh(math.tan(math.radians(la))) / math.pi) / 2 * n
+        return ((fx - x) * 256, (fy - y) * 256)
+    if z >= 12:
+        lat_of = lambda yy: math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * yy / n))))  # noqa: E731
+        la, lo = (lat_of(y) + lat_of(y + 1)) / 2, (x + .5) / n * 360 - 180
+        keys = {tile_of(la + dy, lo + dx, 13) for dy in (-.02, 0, .02) for dx in (-.02, 0, .02)} if z < 14 else {tile_of(la, lo, 13)}
+        for k in keys:
+            data, _ = SYN.osm(k)
+            for poly in data["water"]:
+                d.polygon([px(a, o) for a, o in poly], fill=(212, 218, 226))
+            for w in data["ways"]:
+                pts = [px(*data["nodes"][nd]) for nd in w["nodes"] if nd in data["nodes"]]
+                d.line(pts, fill=(255, 255, 255), width=4 if w["highway"] in ("primary", "secondary") else 2)
+    d.text((6, 6), f"{z}/{x}/{y}", fill=(180, 180, 175))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -104,6 +132,9 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urlparse(self.path)
+        mb = re.match(r"/basemap/\w+/(\d+)/(\d+)/(\d+)\.png", u.path)
+        if mb:
+            return self._send(200, basemap(*map(int, mb.groups())), "image/png")
         m = re.match(r"/terrarium/(\d+)/(\d+)/(\d+)\.png", u.path)
         if m:
             CALLS["terrain"] += 1

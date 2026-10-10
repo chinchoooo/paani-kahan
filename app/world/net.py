@@ -42,6 +42,7 @@ class Upstream:
         self._open_until = 0.0
         self.calls = 0
         self.errors = 0
+        self.busy = 0
         self.bytes = 0
         self.client = httpx.Client(headers=UA, timeout=timeout, follow_redirects=True)
 
@@ -63,6 +64,8 @@ class Upstream:
             raise CircuitOpen(f"{self.name} is cooling off after repeated failures")
         last = None
         for attempt in range(retries + 1):
+            with self._lock:
+                self.busy += 1
             with self.sem:
                 self._pace()
                 t0 = time.time()
@@ -93,6 +96,9 @@ class Upstream:
                                         "ms": round((time.time() - t0) * 1000), "err": f"{type(e).__name__}: {e}"[:80], "url": url[:90]})
                     if client_error:
                         break  # our fault; retrying won't help
+                finally:
+                    with self._lock:
+                        self.busy -= 1
             if attempt < retries:
                 back = (2 ** attempt) * (6 if "429" in str(last) else 1.2)
                 time.sleep(back + random.random() * 0.5)
@@ -116,12 +122,26 @@ def env_list(name, default):
 
 # Shared upstreams. Overpass asks for at most a couple of parallel queries per user.
 OVERPASS = Upstream("OpenStreetMap (Overpass)", max_concurrent=1, min_interval_s=1.0, fail_threshold=6, cooloff_s=45, timeout=180)
+OVERPASS_MIRRORS = {}  # url -> Upstream: each public mirror has its own rate limit, so we use them in parallel
+
+
+def overpass_mirror(url):
+    if url not in OVERPASS_MIRRORS:
+        host = url.split("/")[2]
+        conc = 2 if host == "overpass-api.de" else 1   # overpass-api.de allows a couple of slots per user
+        OVERPASS_MIRRORS[url] = Upstream(f"Overpass · {host}", max_concurrent=conc, min_interval_s=1.0,
+                                         fail_threshold=3, cooloff_s=120, timeout=180)
+    return OVERPASS_MIRRORS[url]
 TERRAIN = Upstream("AWS Terrain Tiles", max_concurrent=8, timeout=20)
 METEO = Upstream("Open-Meteo", max_concurrent=2, min_interval_s=0.2, timeout=30)
 METEO_ARCHIVE = Upstream("Open-Meteo archive (ERA5)", max_concurrent=1, min_interval_s=0.5, timeout=90)
 TOMTOM = Upstream("TomTom Traffic", max_concurrent=1, min_interval_s=1.0, timeout=10)
 NOMINATIM = Upstream("Nominatim", max_concurrent=1, min_interval_s=1.0, timeout=8)
-ALL = [OVERPASS, TERRAIN, METEO, METEO_ARCHIVE, TOMTOM, NOMINATIM]
+ALL = [TERRAIN, METEO, METEO_ARCHIVE, TOMTOM, NOMINATIM]
+
+
+def all_upstreams():
+    return list(OVERPASS_MIRRORS.values()) + ALL
 
 
 # ------------------------------------------------------------------ disk cache

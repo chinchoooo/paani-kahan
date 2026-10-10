@@ -98,19 +98,21 @@ out;"""
             raise
 
     def _fetch(self, q):
+        """Try the least-busy healthy mirror first; mirrors run in parallel, each within its own limits."""
         import json
+        mirrors = [net.overpass_mirror(u) for u in OVERPASS_URLS]
+        order = sorted(range(len(mirrors)), key=lambda i: (mirrors[i].state == "open", mirrors[i].busy, mirrors[i]._fails, (i - self._mirror) % len(mirrors)))
+        self._mirror = (self._mirror + 1) % len(mirrors)
         last = None
-        for i in range(len(OVERPASS_URLS)):
-            url = OVERPASS_URLS[(self._mirror + i) % len(OVERPASS_URLS)]
+        for i in order:
+            m = mirrors[i]
+            if m.state == "open":
+                continue
             try:
-                r = net.OVERPASS.post(url, data={"data": q}, retries=1)
-                self._mirror = (self._mirror + i) % len(OVERPASS_URLS)
-                return json.loads(r.content)
-            except net.CircuitOpen:
-                raise
+                return json.loads(m.post(OVERPASS_URLS[i], data={"data": q}, retries=1).content)
             except Exception as e:  # noqa: BLE001
                 last = e
-        raise RuntimeError(f"All Overpass mirrors failed: {last}")
+        raise RuntimeError(f"All Overpass mirrors failed or cooling off: {last}")
 
 
 def _join_rings(parts):
