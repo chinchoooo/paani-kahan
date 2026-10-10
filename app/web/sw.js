@@ -1,6 +1,6 @@
 /* Paani Kahan service worker.
    - App shell (page, script, styles, icons, fonts): cache first, refreshed in the background.
-   - Map data and forecast (GET /api/area, /api/forecast, ...): network first with a short
+   - Map tiles and forecasts (GET /api/tile/..., /api/summary, ...): network first with a short
      timeout, falling back to the last copy, so the app opens offline with the last forecast.
      Responses served from cache carry an `x-pk-cache` header so the page can say so.
    - Live streams and writes (/api/events, POST): never cached.
@@ -8,10 +8,11 @@
      the forecast and checks the saved commute; if it has flooded, it shows a notification. */
 const V = "__V__";
 const SHELL = `pk-shell-${V}`;
-const DATA = "pk-data-v1";
+const DATA = "pk-data-v3";
+const TERRAIN = "pk-terrain-v1";
 const SHELL_URLS = ["/", "/static/app.js?v=" + V, "/static/app.css?v=" + V, "/manifest.webmanifest",
   "/static/icons/icon-192.png", "/static/icons/icon-512.png"];
-const DATA_GET = ["/api/area", "/api/forecast", "/api/commute", "/api/boot", "/api/status", "/api/search", "/api/nearby", "/api/segment"];
+const DATA_GET = ["/api/tile/", "/api/world", "/api/summary", "/api/commute", "/api/progress", "/api/status", "/api/search", "/api/nearby", "/api/segment", "/api/closures", "/api/reports"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(SHELL).then((c) => c.addAll(SHELL_URLS)).catch(() => {}));
@@ -19,7 +20,7 @@ self.addEventListener("install", (e) => {
 
 self.addEventListener("activate", (e) => {
   e.waitUntil((async () => {
-    for (const k of await caches.keys()) if (k.startsWith("pk-shell-") && k !== SHELL) await caches.delete(k);
+    for (const k of await caches.keys()) if ((k.startsWith("pk-shell-") && k !== SHELL) || k === "pk-data-v1") await caches.delete(k);
     await self.clients.claim();
   })());
 });
@@ -58,8 +59,12 @@ self.addEventListener("fetch", (e) => {
   if (req.method !== "GET") return;
   const url = new URL(req.url);
   if (url.pathname === "/api/events" || url.pathname.startsWith("/api/internal")) return;
+  if (url.origin === location.origin && url.pathname.endsWith("/terrain.png")) {  // immutable per tile build
+    e.respondWith(caches.open(TERRAIN).then(async (c) => (await c.match(req)) || fetch(req).then((r) => { if (r.ok) c.put(req, r.clone()); return r; })));
+    return;
+  }
   if (url.origin === location.origin && DATA_GET.some((p) => url.pathname.startsWith(p))) {
-    e.respondWith(networkFirst(req, url.pathname === "/api/area" ? 8000 : 3500));
+    e.respondWith(networkFirst(req, url.pathname.startsWith("/api/tile/") ? 6000 : 3500));
     return;
   }
   if (req.mode === "navigate") { e.respondWith(networkFirst(req, 2500).then((r) => r.status === 503 ? cacheFirst(new Request("/")) : r)); return; }
@@ -76,8 +81,8 @@ self.addEventListener("periodicsync", (e) => {
 async function backgroundCheck() {
   const cache = await caches.open(DATA);
   try {
-    const fc = await fetch("/api/forecast");
-    if (fc.ok) await cache.put("/api/forecast", fc.clone());
+    const fc = await fetch("/api/summary");
+    if (fc.ok) await cache.put("/api/summary", fc.clone());
     const cm = await fetch("/api/commute?user=priya");
     const persona = cm.ok ? (await cm.json()).persona : null;
     if (!persona || persona.in_window === false) return;  // no commute saved, or it leaves after the 6-hour window

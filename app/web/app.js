@@ -1,4 +1,14 @@
-/* Paani Kahan: map app client. No framework, no build step. */
+/* Paani Kahan v3: map app client. No framework, no build step.
+
+   Data model
+   - The map is made of server tiles (Web Mercator): street-level "detail" tiles (z13,
+     ~5 km) near you and main-road "region" tiles (z10, ~38 km) for 100 km around.
+   - Each tile has immutable geometry (/api/tile/z/x/y) and a forecast that changes with
+     each rain run (/api/tile/z/x/y/forecast). Both are fetched by priority (centre of the
+     screen first), kept in memory (LRU), and cached by the service worker for offline.
+   - Street segments have global ids "<z>/<x>/<y>:<i>". Region tiles are drawn wherever
+     a detail tile isn't loaded yet, so the map is never blank while detail streams in.
+   - Server-sent events say which tiles became ready or got a new forecast. */
 "use strict";
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
@@ -6,17 +16,19 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const lerp = (a, b, t) => a + (b - a) * t;
 const root = document.documentElement;
+const FONT = "'Inter Tight', 'Inter', system-ui, sans-serif";
 
 /* ------------------------------------------------------------- network */
-async function api(path, body) {
+async function api(path, body, opts = {}) {
   try {
-    const r = await fetch(path, body ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : {});
+    const r = await fetch(path, body ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: opts.signal } : { signal: opts.signal });
     const cached = r.headers.get("x-pk-cache");
     if (cached) markOffline(cached); else if (r.ok && !body) markOnline();
     let j = null;
     try { j = await r.json(); } catch { /* empty body */ }
     return { ok: r.ok, status: r.status, j, cached: !!cached };
-  } catch {
+  } catch (e) {
+    if (e?.name === "AbortError") return { ok: false, status: -1, j: null };
     markOffline();
     return { ok: false, status: 0, j: null };
   }
@@ -31,11 +43,12 @@ function markOffline(when) {
 function markOnline() { if (S.offline) { S.offline = false; $("#offline").hidden = true; } }
 
 /* --------------------------------------------------------------- prefs */
-const PREF_KEY = "pk-prefs-v1";
-const prefs0 = Object.assign({ mode: null, theme: "auto", layers: { flood: true, rain: true, sites: false, closures: true }, recent: [], notify: false }, (() => {
+const PREF_KEY = "pk-prefs-v3";
+const LAYERS0 = { flood: true, rain: true, terrain: true, sites: false, closures: true };
+const prefs = Object.assign({ mode: null, theme: "auto", recent: [], notify: false, last: null }, (() => {
   try { return JSON.parse(localStorage.getItem(PREF_KEY) || "{}"); } catch { return {}; }
 })());
-const prefs = prefs0; prefs.layers = Object.assign({ flood: true, rain: true, sites: false, closures: true }, prefs.layers || {});
+prefs.layers = Object.assign({}, LAYERS0, prefs.layers || {});
 function savePrefs() {
   try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch { /* storage blocked */ }
   navigator.serviceWorker?.controller?.postMessage({ type: "prefs", prefs: { mode: S.mode, depart_min: S.persona?.depart_min ?? 0 } });
@@ -45,12 +58,12 @@ function savePrefs() {
 const MODES = [["two_wheeler", "2-wheeler"], ["car", "Car"], ["walk", "Walk"]];
 const LEAVE = [0, 20, 50, 80, 110, 140, 170, 200, 230];
 const S = {
-  area: null, fc: null, user: "priya", mode: prefs.mode || "two_wheeler", depart: 110, t: 110, playing: false,
-  persona: null, commute: null, plan: null, advice: null, adviceLoading: false,
+  cfg: null, sum: null, user: "priya", mode: prefs.mode || "two_wheeler", depart: 110, t: 0, playing: false,
+  persona: null, commute: null, commuteWait: null, plan: null, planWait: null, advice: null, adviceLoading: false,
   view: "home", place: null, trip: null, sel: "best", searchFor: "dest",
-  me: null, meInside: false, nearby: null, ops: null, vuln: null, status: null,
-  drawer: false, tab: "why", hover: -1, intro: 0, fresh: false, offline: false,
-  personaLoaded: false, draft: null, reportAt: null, reports: [], closures: [], closedSegs: new Set(),
+  me: null, nearby: null, ops: null, vuln: null, status: null,
+  drawer: false, tab: "why", hover: null, fresh: false, offline: false,
+  personaLoaded: false, draft: null, reportAt: null, reports: [], closures: [], closedSegs: new Set(), demo: { state: "off" },
 };
 
 /* --------------------------------------------------------------- theme */
@@ -65,162 +78,265 @@ function applyTheme() {
   const cs = getComputedStyle(root), g = (n) => cs.getPropertyValue(n).trim();
   const bg = g("--map-bg"), [r, gg, b] = hexRGB(bg);
   T = {
-    bg, block: g("--map-block"), s: [g("--map-street-0"), g("--map-street-1"), g("--map-street-2")], casing: g("--map-casing"),
+    bg, s: [g("--map-street-0"), g("--map-street-1"), g("--map-street-2")], casing: g("--map-casing"),
     water: g("--map-water"), waterEdge: g("--map-water-edge"), label: g("--map-label"), halo: g("--map-label-halo"),
     locality: g("--map-locality"), alt: g("--map-alt"), routeCasing: g("--map-route-casing"), rain: g("--map-rain"),
-    me: g("--map-me"), accent: g("--accent"), text: g("--text"), w: [hexRGB(g("--w0")), hexRGB(g("--w1")), hexRGB(g("--w2"))],
+    me: g("--map-me"), accent: g("--accent"), text: g("--text"), terrain: g("--map-terrain") || "multiply",
+    w: [hexRGB(g("--w0")), hexRGB(g("--w1")), hexRGB(g("--w2"))],
     dark: (0.299 * r + 0.587 * gg + 0.114 * b) < 128,
   };
   $$('meta[name="theme-color"]').forEach((m) => m.setAttribute("content", g("--bg")));
-  rasterKey = null; routeCache.key = null;
-  if (S.fc) renderTimeline();
+  for (const tl of TILES.values()) { tl.rasKey = null; tl.wetKey = null; }
+  routeCache.key = null;
+  if (S.sum) renderTimeline();
 }
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { applyTheme(); if (S.area) render(); });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { applyTheme(); render(); });
 function waterRGB(d) {
   const r = d / limit(), [c0, c1, c2] = T.w;
-  if (r < 0.6) return c0;
-  if (r < 1) { const u = (r - 0.6) / 0.4; return c0.map((v, i) => Math.round(lerp(v, c1[i], u))); }
-  const u = clamp((r - 1) / 0.4, 0, 1);
-  return c1.map((v, i) => Math.round(lerp(v, c2[i], u)));
+  if (r < 0.5) return c0;
+  if (r < 1) { const u = (r - 0.5) / 0.5; return c0.map((v, i) => Math.round(lerp(v, c1[i], u))); }
+  return c2;  // over the limit: signal red, no in-between
 }
 const rgb = (a) => `rgb(${a[0]},${a[1]},${a[2]})`;
 const statusOf = (d) => d >= limit() ? "alert" : d >= limit() * 0.6 ? "watch" : "clear";
 
 /* ---------------------------------------------------------------- time */
 function clockAt(min) {
-  const [h, m] = S.fc?.now || S.area.now;
+  const [h, m] = S.sum?.now || S.cfg?.run?.now || [0, 0];
   const tot = h * 60 + m + Math.round(min);
   const hh = Math.floor(tot / 60) % 24, mm = ((tot % 60) + 60) % 60;
   return `${((hh + 11) % 12) + 1}:${String(mm).padStart(2, "0")} ${hh < 12 ? "AM" : "PM"}`;
 }
-const limit = () => S.area.limits[S.mode];
+const limit = () => (S.cfg?.limits || { two_wheeler: 30, car: 45, walk: 25 })[S.mode];
 const modeLabel = (m) => MODES.find((x) => x[0] === m)?.[1] || m;
 
-/* ---------------------------------------------------------------- boot */
-async function boot() {
-  applyTheme();
-  const log = $("#boot-log");
-  for (let tries = 0; ; tries++) {
-    const r = await api("/api/boot");
-    if (r.j?.log) log.innerHTML = r.j.log.map((l) => `<li>${esc(l)}</li>`).join("");
-    if (r.j?.ready) break;
-    if (!r.ok && tries > 3) { const a = await api("/api/area"); if (a.ok) break; } // offline, but the area is cached
-    await new Promise((res) => setTimeout(res, 700));
-  }
-  await load();
-  $("#boot").classList.add("gone");
-  setTimeout(() => $("#boot")?.remove(), 600);
-}
-
-async function load() {
-  const a = await api("/api/area");
-  S.area = a.j;
-  prepareArea(S.area);
-  await loadForecast();
-  setUser(S.user, true);
-  const c = await api(`/api/commute?user=priya`);
-  if (c.ok) S.persona = c.j.persona;
-  S.personaLoaded = true;
-  loadReports(); loadClosures();
-  if (S.persona && !prefs.mode && S.persona.mode) S.mode = S.persona.mode;
-  S.depart = S.persona?.depart_min ?? 0;
-  S.t = S.persona?.in_window === false ? 0 : S.depart;
-  render();
-  fitView(true);
-  await refreshCommute();
-  if (S.area.area_id === "trip" || location.search.includes("commute")) openCommute();
-  connectEvents();
-  pollStatus();
-  initLocation(false);
-  scheduleNearby();
-  registerSW();
-  requestAnimationFrame(frame);
-}
-
 /* ------------------------------------------------------------ geometry */
-const G = { segs: [], base: [], water: null, hash: new Map(), cell: 60, bounds: null, labels: [] };
+// One fixed equirectangular projection around the session origin (metres).
+const G = { lat0: 13, lon0: 80.2, mlat: 110574, mlon: 108000 };
 const proj = (lat, lon) => [(lon - G.lon0) * G.mlon, -(lat - G.lat0) * G.mlat];
 const unproj = (x, y) => [G.lat0 - y / G.mlat, G.lon0 + x / G.mlon];
+function setOrigin(lat, lon) {
+  G.lat0 = lat; G.lon0 = lon; G.mlon = 111320 * Math.cos(lat * Math.PI / 180);
+  TILES.clear(); SEGS.clear(); routeCache.key = null;
+}
+function haversine(a, b, c, d) {
+  const R = 6371000, p1 = a * Math.PI / 180, p2 = c * Math.PI / 180, dp = p2 - p1, dl = (d - b) * Math.PI / 180;
+  return 2 * R * Math.asin(Math.sqrt(Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2));
+}
+// slippy tiles
+function tileXY(lat, lon, z) {
+  const n = 2 ** z, x = Math.floor((lon + 180) / 360 * n);
+  const y = Math.floor((1 - Math.asinh(Math.tan(lat * Math.PI / 180)) / Math.PI) / 2 * n);
+  return [clamp(x, 0, n - 1), clamp(y, 0, n - 1)];
+}
+function tileBBox(z, x, y) {
+  const n = 2 ** z, lat = (yy) => Math.atan(Math.sinh(Math.PI * (1 - 2 * yy / n))) * 180 / Math.PI;
+  return [lat(y + 1), x / n * 360 - 180, lat(y), (x + 1) / n * 360 - 180];
+}
 
-function prepareArea(a) {
-  const [s, w, n, e] = a.bbox;
-  G.lat0 = (s + n) / 2; G.lon0 = (w + e) / 2;
-  G.mlat = 110574; G.mlon = 111320 * Math.cos(G.lat0 * Math.PI / 180);
-  const [x0, y0] = proj(n, w), [x1, y1] = proj(s, e);
-  G.bounds = { x0, y0, x1, y1 };
-  G.cell = Math.max(60, (a.cell_m || 20) * 3);
-  G.hash = new Map();
-  G.base = [new Path2D(), new Path2D(), new Path2D()];
-  const byName = new Map();
-  G.segs = a.segments.map(([cls, nameI, locI, flat, flags = 0], i) => {
+/* --------------------------------------------------------------- tiles */
+const TILES = new Map();   // "z/x/y" -> tile
+const SEGS = new Map();    // gid -> segment
+const DZ = 13, RZ = 10;
+function tileObj(key) {
+  let tl = TILES.get(key);
+  if (!tl) {
+    const [z, x, y] = key.split("/").map(Number);
+    const bb = tileBBox(z, x, y), [x0, y0] = proj(bb[2], bb[1]), [x1, y1] = proj(bb[0], bb[3]);
+    tl = { key, z, x, y, lod: z === DZ ? "detail" : "region", bbox: bb, wb: { x0, y0, x1, y1 }, status: "new", geo: null, fc: null,
+      tries: 0, next: 0, fcNext: 0, fcWant: null, born: 0, used: 0, rasKey: null, wetKey: null, terrain: null };
+    TILES.set(key, tl);
+  }
+  return tl;
+}
+function prepareTile(tl, g) {
+  tl.geo = g;
+  if (g.empty) { tl.status = "empty"; return; }
+  const segs = [], byName = new Map(), base = [new Path2D(), new Path2D(), new Path2D()], hash = new Map(), CELL = 80;
+  const [olat, olon] = g.origin;
+  g.segments.forEach(([cls, nameI, locI, flat, flags], i) => {
     const pts = new Float32Array(flat.length);
-    for (let k = 0; k < flat.length; k += 2) { const [x, y] = proj(flat[k], flat[k + 1]); pts[k] = x; pts[k + 1] = y; }
-    const p = G.base[cls];
+    let la = Math.round(olat * 1e6), lo = Math.round(olon * 1e6);
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (let k = 0; k < flat.length; k += 2) {
+      la += flat[k]; lo += flat[k + 1];
+      const [x, y] = proj(la / 1e6, lo / 1e6); pts[k] = x; pts[k + 1] = y;
+      x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+    }
+    const p = base[cls];
     p.moveTo(pts[0], pts[1]);
     let len = 0;
     for (let k = 2; k < pts.length; k += 2) { p.lineTo(pts[k], pts[k + 1]); len += Math.hypot(pts[k] - pts[k - 2], pts[k + 1] - pts[k - 1]); }
-    for (let k = 0; k < pts.length - 2; k += 2) {
-      const steps = Math.max(1, Math.ceil(Math.hypot(pts[k + 2] - pts[k], pts[k + 3] - pts[k + 1]) / (G.cell / 2)));
-      for (let q = 0; q <= steps; q++) {
-        const x = lerp(pts[k], pts[k + 2], q / steps), y = lerp(pts[k + 1], pts[k + 3], q / steps);
-        const key = `${Math.floor(x / G.cell)},${Math.floor(y / G.cell)}`;
-        let arr = G.hash.get(key); if (!arr) G.hash.set(key, (arr = []));
-        if (arr[arr.length - 1] !== i) arr.push(i);
-      }
+    for (let cx = Math.floor(x0 / CELL); cx <= Math.floor(x1 / CELL); cx++) for (let cy = Math.floor(y0 / CELL); cy <= Math.floor(y1 / CELL); cy++) {
+      const key = cx + "," + cy; let arr = hash.get(key); if (!arr) hash.set(key, (arr = [])); arr.push(i);
     }
-    const mid = Math.floor(pts.length / 4) * 2;
-    const name = a.names[nameI];
-    const sg = { i, cls, name, loc: a.localities[locI]?.name || "", pts, mx: pts[mid], my: pts[mid + 1], len,
+    const mid = Math.floor(pts.length / 4) * 2, name = g.names[nameI], gid = `${tl.key}:${i}`;
+    const sg = { gid, i, tile: tl, cls, name, loc: g.localities[locI]?.name || "", pts, mx: pts[mid], my: pts[mid + 1], len,
       bridge: !!(flags & 1), underpass: !!(flags & 2), construction: !!(flags & 4) };
     if (!name.startsWith("Unnamed") && len > 70) { if (!byName.has(name)) byName.set(name, []); byName.get(name).push(sg); }
-    return sg;
+    segs.push(sg); SEGS.set(gid, sg);
   });
-  // street-name labels: a few of the longest pieces of each street, spread apart
-  G.labels = [];
+  const labels = [];
   for (const [name, list] of byName) {
     list.sort((p, q) => q.len - p.len);
     const kept = [];
     for (const sg of list) {
-      if (kept.length >= 4) break;
-      if (kept.some((k) => Math.hypot(k.mx - sg.mx, k.my - sg.my) < 500)) continue;
+      if (kept.length >= 3) break;
+      if (kept.some((k) => Math.hypot(k.mx - sg.mx, k.my - sg.my) < 600)) continue;
       kept.push(sg);
     }
-    for (const sg of kept) G.labels.push({ name, cls: sg.cls, sg });
+    for (const sg of kept) labels.push({ name, cls: sg.cls, sg });
   }
-  G.labels.sort((p, q) => p.cls - q.cls || q.sg.len - p.sg.len);
-  G.water = new Path2D();
-  for (const poly of a.water) {
-    poly.forEach(([la, lo], k) => { const [x, y] = proj(la, lo); k ? G.water.lineTo(x, y) : G.water.moveTo(x, y); });
-    G.water.closePath();
+  labels.sort((p, q) => p.cls - q.cls || q.sg.len - p.sg.len);
+  const water = new Path2D();
+  for (const poly of g.water) {
+    poly.forEach(([la, lo], k) => { const [x, y] = proj(la, lo); k ? water.lineTo(x, y) : water.moveTo(x, y); });
+    water.closePath();
   }
-  G.locs = a.localities.map((L) => ({ name: L.name, xy: proj(L.lat, L.lon) }));
+  Object.assign(tl, { segs, base, hash, CELL, labels, water, status: "ready", born: performance.now(),
+    locs: (g.own_localities || []).map((i) => ({ name: g.localities[i].name, xy: proj(g.localities[i].lat, g.localities[i].lon) })),
+    pois: g.pois || [] });
+  if (prefs.layers.terrain) loadTerrain(tl);
+}
+function dropTile(tl) {
+  if (tl.segs) for (const sg of tl.segs) SEGS.delete(sg.gid);
+  TILES.delete(tl.key);
+}
+function loadTerrain(tl) {
+  if (tl.terrain || tl.status !== "ready") return;
+  const img = new Image();
+  img.onload = () => { tl.terrain = img; };
+  img.onerror = () => { tl.terrain = null; tl.terrainFail = performance.now(); };
+  tl.terrain = "loading";
+  img.src = `/api/tile/${tl.key}/terrain.png?b=${tl.geo?.built || 0}`;
+}
+function b64(s) { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
+function setTileForecast(tl, j) {
+  const fc = { ...j, seg: b64(j.seg_depth), ras: b64(j.raster), rain: b64(j.rain), n: j.frames };
+  delete fc.seg_depth; delete fc.raster;
+  const [s, w, n, e] = j.raster_bbox, [x0, y0] = proj(n, w), [x1, y1] = proj(s, e);
+  fc.rb = { x0, y0, x1, y1 };
+  const first = !tl.fc;
+  tl.fc = fc; tl.rasKey = null; tl.wetKey = null; tl.fcBorn = first ? performance.now() : tl.fcBorn;
+}
+
+/* fetch scheduling */
+const NET = { geo: 0, fc: 0, maxGeo: 4, maxFc: 4 };
+let tilesDirty = true;
+function viewBBox(pad = 0) {
+  const p = pads(), [ax, ay] = toWorld(p.l - pad, p.t - pad), [bx, by] = toWorld(W - p.r + pad, H - p.b + pad);
+  const [n, w] = unproj(ax, ay), [s, e] = unproj(bx, by);
+  return [Math.min(s, n), Math.min(w, e), Math.max(s, n), Math.max(w, e)];
+}
+const mpp = () => 1 / V.k;  // metres per CSS pixel
+const showDetail = () => mpp() < 28;
+function wantedTiles() {
+  const out = [];
+  const bb = viewBBox(80), [cx, cy] = [V.cx, V.cy];
+  const add = (z) => {
+    const [x0, y0] = tileXY(bb[2], bb[1], z), [x1, y1] = tileXY(bb[0], bb[3], z);
+    if ((x1 - x0 + 1) * (y1 - y0 + 1) > 64) return;
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      const tl = tileObj(`${z}/${x}/${y}`), wb = tl.wb;
+      tl.dist = Math.hypot((wb.x0 + wb.x1) / 2 - cx, (wb.y0 + wb.y1) / 2 - cy) + (z === RZ ? 2000 : 0);
+      out.push(tl);
+    }
+  };
+  if (showDetail()) add(DZ);
+  add(RZ);
+  return out.sort((a, b) => a.dist - b.dist);
+}
+async function fetchGeo(tl) {
+  NET.geo++; tl.status = "loading";
+  const r = await api(`/api/tile/${tl.key}`);
+  NET.geo--;
+  if (r.status === 200 && r.j) { prepareTile(tl, r.j); tl.tries = 0; tilesDirty = true; maybeRefreshViews(); }
+  else { tl.status = "pending"; tl.tries++; tl.next = performance.now() + Math.min(15000, 1500 * tl.tries); tl.serverStatus = r.j?.status; }
+}
+async function fetchFc(tl) {
+  NET.fc++; tl.fcLoading = true;
+  const r = await api(`/api/tile/${tl.key}/forecast`);
+  NET.fc--; tl.fcLoading = false; tl.fcWant = null;
+  if (r.status === 200 && r.j) { setTileForecast(tl, r.j); tl.fcNext = 0; maybeRefreshViews(); }
+  else tl.fcNext = performance.now() + 2500;
+}
+function pumpTiles() {
+  const now = performance.now(), want = wantedTiles(), keep = new Set();
+  for (const tl of want) {
+    keep.add(tl.key); tl.used = now;
+    if ((tl.status === "new" || tl.status === "pending") && now >= tl.next && NET.geo < NET.maxGeo) fetchGeo(tl);
+    if (tl.status === "ready" && !tl.fcLoading && NET.fc < NET.maxFc && now >= tl.fcNext && (!tl.fc || tl.fcWant)) fetchFc(tl);
+    if (tl.status === "ready" && prefs.layers.terrain && !tl.terrain && (!tl.terrainFail || now - tl.terrainFail > 20000)) loadTerrain(tl);
+  }
+  // keep memory bounded: drop far tiles that haven't been on screen for a while
+  if (TILES.size > 120) {
+    const old = [...TILES.values()].filter((t) => !keep.has(t.key)).sort((a, b) => a.used - b.used);
+    for (const t of old.slice(0, TILES.size - 100)) dropTile(t);
+  }
+  updateLoadbar(want);
+}
+setInterval(pumpTiles, 350);
+function updateLoadbar(want) {
+  const vis = want.filter((t) => t.lod === (showDetail() ? "detail" : "region") && t.status !== "empty");
+  const done = vis.filter((t) => t.status === "ready" && t.fc).length;
+  const bar = $("#loadbar"), frac = vis.length ? done / vis.length : 1;
+  bar.classList.toggle("idle", frac >= 1);
+  $("i", bar).style.width = `${Math.round(frac * 100)}%`;
+}
+let focusTimer = null, lastFocus = null;
+function sendFocus(force) {
+  clearTimeout(focusTimer);
+  focusTimer = setTimeout(async () => {
+    const [lat, lon] = S.me ? [S.me.lat, S.me.lon] : unproj(V.cx, V.cy);
+    const key = `${lat.toFixed(3)},${lon.toFixed(3)},${V.k.toFixed(3)}`;
+    if (!force && key === lastFocus) return;
+    lastFocus = key;
+    const r = await api("/api/focus", { lat, lon, view: viewBBox() });
+    if (r.ok) S.progress = r.j.progress;
+    // the 6-hour rain picture is for a place: refresh it when the map moves somewhere else
+    if (!S.sumAt || haversine(lat, lon, S.sumAt[0], S.sumAt[1]) > 3000) loadSummary();
+    prefs.last = [lat, lon]; savePrefs();
+  }, force ? 0 : 700);
 }
 
 /* ------------------------------------------------------------ forecast */
-function b64(s) { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
-async function loadForecast() {
-  const { j } = await api("/api/forecast");
-  if (!j || !j.seg_depth) return;
-  S.fc = { ...j, seg: b64(j.seg_depth), ras: b64(j.raster), rain: b64(j.rain), n: j.times.length };
-  rasterKey = null;
-  renderTimeline();
+function segFc(sg) { return sg?.tile?.fc; }
+function depthAt(gid, t) {
+  const sg = typeof gid === "string" ? SEGS.get(gid) : gid, fc = segFc(sg);
+  if (!fc || !fc.nseg) return 0;
+  const f = clamp(t / 10, 0, fc.n - 1), a = Math.floor(f), b = Math.min(a + 1, fc.n - 1), N = fc.nseg;
+  return lerp(fc.seg[a * N + sg.i], fc.seg[b * N + sg.i], f - a);
 }
-function depthAt(i, t) {
-  const f = clamp(t / 10, 0, S.fc.n - 1), a = Math.floor(f), b = Math.min(a + 1, S.fc.n - 1), N = S.fc.nseg;
-  return lerp(S.fc.seg[a * N + i], S.fc.seg[b * N + i], f - a);
+function tileAt(x, y, lod) {
+  for (const tl of TILES.values()) if ((!lod || tl.lod === lod) && tl.fc && x >= tl.wb.x0 && x <= tl.wb.x1 && y >= tl.wb.y0 && y <= tl.wb.y1) return tl;
+  return null;
 }
 function rainAt(t, x, y) {
-  const [rr, cc] = S.fc.rain_shape, { x0, y0, x1, y1 } = G.bounds;
-  const c = Math.floor((x - x0) / (x1 - x0) * cc), r = Math.floor((y - y0) / (y1 - y0) * rr);
-  if (r < 0 || c < 0 || r >= rr || c >= cc) return 0;
-  const f = clamp(t / 10, 0, S.fc.n - 1), a = Math.floor(f), b = Math.min(a + 1, S.fc.n - 1), sz = rr * cc;
-  return lerp(S.fc.rain[a * sz + r * cc + c], S.fc.rain[b * sz + r * cc + c], f - a);
+  const tl = tileAt(x, y, "detail") || tileAt(x, y, "region");
+  if (!tl) { const f = clamp(Math.round(t / 10), 0, (S.sum?.rain_mean.length || 1) - 1); return S.sum?.rain_mean[f] || 0; }
+  const fc = tl.fc, [rr, cc] = fc.rain_shape, { x0, y0, x1, y1 } = fc.rb;
+  const c = clamp(Math.floor((x - x0) / (x1 - x0) * cc), 0, cc - 1), r = clamp(Math.floor((y - y0) / (y1 - y0) * rr), 0, rr - 1);
+  const f = clamp(t / 10, 0, fc.n - 1), a = Math.floor(f), b = Math.min(a + 1, fc.n - 1), sz = rr * cc;
+  return lerp(fc.rain[a * sz + r * cc + c], fc.rain[b * sz + r * cc + c], f - a);
+}
+async function loadSummary() {
+  const [lat, lon] = S.me ? [S.me.lat, S.me.lon] : unproj(V.cx, V.cy);
+  const r = await api(`/api/summary?lat=${lat}&lon=${lon}`);
+  if (r.ok) {
+    S.sumAt = [lat, lon];
+    const changed = S.sum?.run_id !== r.j.run_id;
+    S.sum = r.j; S.progress = r.j.progress; S.demo = r.j.demo || S.demo;
+    $("#demo-badge").hidden = r.j.mode !== "demo";
+    if (changed) for (const tl of TILES.values()) if (tl.fc && tl.fc.run_id !== r.j.run_id) tl.fcWant = true;
+    renderTimeline();
+  }
 }
 
 /* -------------------------------------------------------------- canvas */
 const cv = $("#map"), ctx = cv.getContext("2d");
 let W = 0, H = 0, DPR = 1;
-const V = { cx: 0, cy: 0, k: 0.2, fitK: 0.2 };
+const V = { cx: 0, cy: 0, k: 0.3 };
+const K_MIN = 1 / 300, K_MAX = 6;
 const anim = { from: null, to: null, t0: 0, dur: 0 };
 const isDesk = () => innerWidth >= 900;
 function resize() {
@@ -228,66 +344,75 @@ function resize() {
   W = innerWidth; H = innerHeight;
   cv.width = W * DPR; cv.height = H * DPR;
   applySheet();
-  if (S.fc) renderTimeline();
+  if (S.sum) renderTimeline();
 }
 addEventListener("resize", resize);
-
 function pads() {
   if (isDesk()) return { l: 424, r: 80, t: 70, b: 96 };
   const sv = parseFloat(getComputedStyle(root).getPropertyValue("--sheet-visible")) || 0;
   return { l: 16, r: 64, t: 120, b: Math.min(sv, H * 0.5) + 84 };
 }
-function fitView(intro) {
-  if (!G.bounds) return;
-  const p = pads(), { x0, y0, x1, y1 } = G.bounds;
-  const k = Math.min((W - p.l - p.r) / (x1 - x0), (H - p.t - p.b) / (y1 - y0));
-  const to = { cx: (x0 + x1) / 2 - ((p.l - p.r) / 2) / k, cy: (y0 + y1) / 2 - ((p.t - p.b) / 2) / k, k };
-  V.fitK = k;
-  if (intro) { Object.assign(V, { ...to, k: k * 0.85 }); Object.assign(anim, { from: { ...V }, to, t0: performance.now(), dur: 1600 }); }
-  else Object.assign(anim, { from: { ...V }, to, t0: performance.now(), dur: 700 });
-}
-function flyTo(x, y, k) {
+function centreOn(x, y, k, dur = 900) {
   const p = pads();
-  k = k || Math.max(V.k, V.fitK * 2.6);
-  Object.assign(anim, { from: { ...V }, to: { cx: x - ((p.l - p.r) / 2) / k, cy: y - ((p.t - p.b) / 2) / k, k }, t0: performance.now(), dur: 900 });
+  k = clamp(k || V.k, K_MIN, K_MAX);
+  const to = { cx: x - ((p.l - p.r) / 2) / k, cy: y - ((p.t - p.b) / 2) / k, k };
+  if (!dur) { Object.assign(V, to); return; }
+  Object.assign(anim, { from: { ...V }, to, t0: performance.now(), dur });
 }
+const flyTo = (x, y, k) => centreOn(x, y, k || Math.max(V.k, 0.6));
 function fitPoints(pts) {
   if (!pts.length) return;
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const [x, y] of pts) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
-  const p = pads(), k = clamp(Math.min((W - p.l - p.r) / Math.max(x1 - x0, 200), (H - p.t - p.b) / Math.max(y1 - y0, 200)) * 0.9, V.fitK * 0.8, V.fitK * 10);
-  Object.assign(anim, { from: { ...V }, to: { cx: (x0 + x1) / 2 - ((p.l - p.r) / 2) / k, cy: (y0 + y1) / 2 - ((p.t - p.b) / 2) / k, k }, t0: performance.now(), dur: 800 });
+  const p = pads(), k = clamp(Math.min((W - p.l - p.r) / Math.max(x1 - x0, 300), (H - p.t - p.b) / Math.max(y1 - y0, 300)) * 0.9, K_MIN, 2);
+  centreOn((x0 + x1) / 2, (y0 + y1) / 2, k, 800);
 }
 const toScreen = (x, y) => [(x - V.cx) * V.k + W / 2, (y - V.cy) * V.k + H / 2];
 const toWorld = (sx, sy) => [(sx - W / 2) / V.k + V.cx, (sy - H / 2) / V.k + V.cy];
 
-let rasterKey = null; const rasCv = document.createElement("canvas"); const rainCv = document.createElement("canvas");
-function buildRasters() {
-  const key = `${S.fc.run_id}|${S.mode}|${Math.round(S.t)}|${T.dark}`;
-  if (key === rasterKey) return;
-  rasterKey = key;
-  const [rr, cc] = S.fc.raster_shape, sz = rr * cc;
-  const f = clamp(S.t / 10, 0, S.fc.n - 1), a = Math.floor(f), b = Math.min(a + 1, S.fc.n - 1), u = f - a;
-  rasCv.width = cc; rasCv.height = rr;
-  const rc = rasCv.getContext("2d"), img = rc.createImageData(cc, rr), amax = T.dark ? 170 : 120;
+function buildTileRaster(tl) {
+  const fc = tl.fc, key = `${fc.run_id}|${fc.observations}|${S.mode}|${Math.round(S.t)}|${T.dark}`;
+  if (key === tl.rasKey) return;
+  tl.rasKey = key;
+  const [rr, cc] = fc.raster_shape, sz = rr * cc;
+  const f = clamp(S.t / 10, 0, fc.n - 1), a = Math.floor(f), b = Math.min(a + 1, fc.n - 1), u = f - a;
+  tl.rasCv = tl.rasCv || document.createElement("canvas");
+  tl.rasCv.width = cc; tl.rasCv.height = rr;
+  const rc = tl.rasCv.getContext("2d"), img = rc.createImageData(cc, rr), amax = T.dark ? 190 : 150, L = limit();
   for (let i = 0; i < sz; i++) {
-    const d = lerp(S.fc.ras[a * sz + i], S.fc.ras[b * sz + i], u);
+    const d = lerp(fc.ras[a * sz + i], fc.ras[b * sz + i], u);
     if (d < 6) continue;
     const c = waterRGB(d);
     img.data[i * 4] = c[0]; img.data[i * 4 + 1] = c[1]; img.data[i * 4 + 2] = c[2];
-    img.data[i * 4 + 3] = Math.round(Math.pow(clamp((d - 6) / (limit() * 1.4), 0, 1), 0.8) * amax);
+    img.data[i * 4 + 3] = Math.round(Math.pow(clamp((d - 6) / (L * 1.3), 0, 1), 0.75) * amax);
   }
   rc.putImageData(img, 0, 0);
-  const [r2, c2] = S.fc.rain_shape, s2 = r2 * c2, [rr0, rg0, rb0] = T.rain.split(",").map(Number);
-  rainCv.width = c2; rainCv.height = r2;
-  const rc2 = rainCv.getContext("2d"), im2 = rc2.createImageData(c2, r2);
+  const [r2, c2] = fc.rain_shape, s2 = r2 * c2, [rr0, rg0, rb0] = T.rain.split(",").map(Number);
+  tl.rainCv = tl.rainCv || document.createElement("canvas");
+  tl.rainCv.width = c2; tl.rainCv.height = r2;
+  const rc2 = tl.rainCv.getContext("2d"), im2 = rc2.createImageData(c2, r2);
   for (let i = 0; i < s2; i++) {
-    const v = lerp(S.fc.rain[a * s2 + i], S.fc.rain[b * s2 + i], u), row = Math.floor(i / c2), col = i % c2;
-    const edge = clamp(Math.min(row, r2 - 1 - row, col, c2 - 1 - col) / 4, 0, 1);
+    const v = lerp(fc.rain[a * s2 + i], fc.rain[b * s2 + i], u);
     im2.data[i * 4] = rr0; im2.data[i * 4 + 1] = rg0; im2.data[i * 4 + 2] = rb0;
-    im2.data[i * 4 + 3] = Math.round(clamp((v - 8) / 80, 0, 1) * (T.dark ? 34 : 46) * edge);
+    im2.data[i * 4 + 3] = Math.round(clamp((v - 8) / 80, 0, 1) * (T.dark ? 40 : 46));
   }
   rc2.putImageData(im2, 0, 0);
+}
+function buildWet(tl) {
+  const fc = tl.fc, key = `${fc.run_id}|${fc.observations}|${S.mode}|${Math.round(S.t / 2)}`;
+  if (key === tl.wetKey) return tl.wet;
+  tl.wetKey = key;
+  const buckets = new Map(), L = limit();
+  for (const sg of tl.segs) {
+    const d = depthAt(sg, S.t);
+    if (d < 6) continue;
+    const lvl = Math.min(11, Math.floor(d / L * 6));
+    let b = buckets.get(lvl); if (!b) buckets.set(lvl, (b = { p: new Path2D(), d: 0, w: 0 }));
+    segPath(sg, b.p);
+    b.d = Math.max(b.d, (lvl + 0.5) / 6 * L); b.w = Math.max(b.w, BW[sg.cls]);
+  }
+  tl.wet = [...buckets].sort((p, q) => p[0] - q[0]);
+  return tl.wet;
 }
 
 const drops = Array.from({ length: 320 }, () => ({ x: Math.random(), y: Math.random(), s: 0.6 + Math.random() * 0.8, l: 6 + Math.random() * 10 }));
@@ -296,10 +421,10 @@ function frame(ts) {
   const dt = Math.min(50, ts - (lastTs || ts)); lastTs = ts;
   if (anim.to) {
     const u = clamp((ts - anim.t0) / anim.dur, 0, 1), e = 1 - Math.pow(1 - u, 3);
-    V.cx = lerp(anim.from.cx, anim.to.cx, e); V.cy = lerp(anim.from.cy, anim.to.cy, e); V.k = lerp(anim.from.k, anim.to.k, e);
-    if (u >= 1) anim.to = null;
+    V.cx = lerp(anim.from.cx, anim.to.cx, e); V.cy = lerp(anim.from.cy, anim.to.cy, e);
+    V.k = Math.exp(lerp(Math.log(anim.from.k), Math.log(anim.to.k), e));
+    if (u >= 1) { anim.to = null; sendFocus(); }
   }
-  S.intro = Math.min(1, S.intro + dt / 1200);
   if (S.playing) {
     S.t += dt / 1000 * 26;
     if (S.t >= 360) { S.t = 360; setPlaying(false); }
@@ -309,110 +434,159 @@ function frame(ts) {
   draw(ts, dt);
   requestAnimationFrame(frame);
 }
-
 function segPath(sg, p = new Path2D()) {
   p.moveTo(sg.pts[0], sg.pts[1]);
   for (let q = 2; q < sg.pts.length; q += 2) p.lineTo(sg.pts[q], sg.pts[q + 1]);
   return p;
 }
-
+const BW = [1.9, 1.25, 0.75];
+function visibleTiles() {
+  const p = pads(), [ax, ay] = toWorld(0, 0), [bx, by] = toWorld(W, H);
+  const out = [];
+  for (const tl of TILES.values()) {
+    if (tl.status !== "ready") continue;
+    const wb = tl.wb;
+    if (wb.x1 < ax || wb.x0 > bx || wb.y1 < ay || wb.y0 > by) continue;
+    out.push(tl);
+  }
+  return out;
+}
 function draw(ts, dt) {
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   ctx.fillStyle = T.bg; ctx.fillRect(0, 0, W, H);
-  if (!S.fc || !G.bounds) return;
-  buildRasters();
-  const k = V.k, zw = Math.sqrt(clamp(k / V.fitK, 1, 8)), px = 1 / k, { x0, y0, x1, y1 } = G.bounds;
+  if (!S.cfg) return;
+  const k = V.k, zw = Math.sqrt(clamp(k / 0.25, 0.35, 8)), px = 1 / k;
+  const vis = visibleTiles(), det = showDetail() ? vis.filter((t) => t.lod === "detail") : [], reg = vis.filter((t) => t.lod === "region");
   ctx.setTransform(DPR * k, 0, 0, DPR * k, DPR * (W / 2 - V.cx * k), DPR * (H / 2 - V.cy * k));
-  ctx.fillStyle = T.block; ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
-  ctx.fillStyle = T.water; ctx.fill(G.water);
-  ctx.strokeStyle = T.waterEdge; ctx.lineWidth = px; ctx.stroke(G.water);
-  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
-  if (prefs.layers.rain) ctx.drawImage(rainCv, x0, y0, x1 - x0, y1 - y0);
-  if (prefs.layers.flood) {
-    ctx.globalCompositeOperation = T.dark ? "lighter" : "source-over";
-    ctx.globalAlpha = 0.9 * S.intro;
-    ctx.drawImage(rasCv, x0, y0, x1 - x0, y1 - y0);
-    ctx.globalAlpha = 1; ctx.globalCompositeOperation = "source-over";
-  }
-  // streets (light theme gets a casing, like a paper map)
-  ctx.lineCap = "round"; ctx.lineJoin = "round";
-  const bw = [1.7, 1.15, 0.7];
-  ctx.globalAlpha = S.intro;
-  if (T.casing !== "transparent") for (let c = 2; c >= 0; c--) { ctx.strokeStyle = T.casing; ctx.lineWidth = (bw[c] * zw + 1.4) * px; ctx.stroke(G.base[c]); }
-  for (let c = 2; c >= 0; c--) { ctx.strokeStyle = T.s[c]; ctx.lineWidth = bw[c] * zw * px; ctx.stroke(G.base[c]); }
-  ctx.globalAlpha = 1;
-  // wet streets
-  if (prefs.layers.flood) {
-    const buckets = new Map();
-    for (const sg of G.segs) {
-      const d = depthAt(sg.i, S.t);
-      if (d < 6) continue;
-      const lvl = Math.min(11, Math.floor(d / limit() * 6));
-      let b = buckets.get(lvl); if (!b) buckets.set(lvl, (b = { p: new Path2D(), d: 0, w: 0 }));
-      segPath(sg, b.p);
-      b.d = Math.max(b.d, (lvl + 0.5) / 6 * limit()); b.w = Math.max(b.w, bw[sg.cls]);
+  // region underlay, clipped to where street-level tiles aren't loaded yet
+  if (reg.length) {
+    ctx.save();
+    if (det.length) {
+      const clip = new Path2D(), [ax, ay] = toWorld(-50, -50), [bx, by] = toWorld(W + 50, H + 50);
+      clip.rect(ax, ay, bx - ax, by - ay);
+      for (const t of det) clip.rect(t.wb.x0, t.wb.y0, t.wb.x1 - t.wb.x0, t.wb.y1 - t.wb.y0);
+      ctx.clip(clip, "evenodd");
     }
-    for (const [lvl, b] of [...buckets].sort((p, q) => p[0] - q[0])) {
-      const c = waterRGB(b.d), a = clamp(0.25 + lvl / 6, 0.25, 1);
-      if (lvl >= 3) { ctx.strokeStyle = `rgba(${c},${a * 0.22 * S.intro})`; ctx.lineWidth = (b.w + 6) * zw * px; ctx.stroke(b.p); }
-      ctx.strokeStyle = `rgba(${c},${a * S.intro})`; ctx.lineWidth = (b.w + 1) * zw * px; ctx.stroke(b.p);
-    }
+    drawLayer(reg, ts, px, zw, true);
+    ctx.restore();
   }
-  if (prefs.layers.closures) drawClosures(px, zw, bw);
-  if (S.view === "place" && S.place?.seg != null) {
-    const sg = G.segs[S.place.seg], p = segPath(sg);
-    ctx.strokeStyle = T.text; ctx.globalAlpha = 0.3; ctx.lineWidth = (bw[sg.cls] + 4) * zw * px; ctx.stroke(p);
-    ctx.globalAlpha = 1; ctx.lineWidth = (bw[sg.cls] + 1.2) * zw * px; ctx.stroke(p);
+  if (det.length) drawLayer(det, ts, px, zw, false);
+  drawClosures(px, zw);
+  const place = S.view === "place" && S.place?.gid ? SEGS.get(S.place.gid) : null;
+  if (place) {
+    const p = segPath(place);
+    ctx.strokeStyle = T.text; ctx.globalAlpha = 0.25; ctx.lineWidth = (BW[place.cls] + 5) * zw * px; ctx.stroke(p);
+    ctx.globalAlpha = 1; ctx.lineWidth = (BW[place.cls] + 1.6) * zw * px; ctx.stroke(p);
   }
-  if (S.hover >= 0) {
-    const sg = G.segs[S.hover];
-    ctx.strokeStyle = T.text; ctx.globalAlpha = 0.65; ctx.lineWidth = (bw[sg.cls] + 1.4) * zw * px; ctx.stroke(segPath(sg)); ctx.globalAlpha = 1;
+  if (S.hover) {
+    const sg = SEGS.get(S.hover);
+    if (sg) { ctx.strokeStyle = T.text; ctx.globalAlpha = 0.6; ctx.lineWidth = (BW[sg.cls] + 1.4) * zw * px; ctx.stroke(segPath(sg)); ctx.globalAlpha = 1; }
   }
   if (S.view === "dir" && S.plan) drawRoutes(px, zw);
 
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   if (prefs.layers.rain) drawRain(dt);
-  drawStreetLabels();
-  drawLocalityLabels();
+  drawStreetLabels(det.length ? det : reg);
+  drawLocalityLabels(det.length && mpp() < 14 ? det : reg);
   if (S.view === "dir" && S.plan) drawRouteMarkers(ts);
   if (S.view === "place" && S.place) dropPin(...proj(S.place.lat, S.place.lon));
   if (prefs.layers.sites && S.vuln) for (const p of S.vuln.sites || []) ring(...proj(p.lat, p.lon), p.name, ts);
   drawClosureMarks();
   drawReports();
   drawMe(ts);
-  if (T.dark) {
-    const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.4, W / 2, H / 2, Math.max(W, H) * 0.8);
-    g.addColorStop(0, "rgba(11,18,21,0)"); g.addColorStop(1, "rgba(11,18,21,.55)");
-    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+function drawLayer(tiles, ts, px, zw, region) {
+  const now = performance.now();
+  // terrain + water bodies
+  for (const tl of tiles) {
+    const a = clamp((now - tl.born) / 500, 0, 1);
+    ctx.globalAlpha = a;
+    if (prefs.layers.terrain && tl.terrain instanceof Image) {
+      // light: multiply (white = no change). dark: inverted and screened, so low ground glows faintly
+      ctx.globalCompositeOperation = T.dark ? "screen" : "multiply"; ctx.globalAlpha = a * (T.dark ? 0.16 : 0.6);
+      if (T.dark) ctx.filter = "invert(1)";
+      const r = tl.fc?.rb || tl.wb;
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(tl.terrain, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+      ctx.filter = "none"; ctx.globalCompositeOperation = "source-over"; ctx.globalAlpha = a;
+    }
+    ctx.fillStyle = T.water; ctx.fill(tl.water);
+  }
+  ctx.globalAlpha = 1;
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
+  for (const tl of tiles) {
+    if (!tl.fc) continue;
+    buildTileRaster(tl);
+    const r = tl.fc.rb, a = clamp((now - (tl.fcBorn || 0)) / 700, 0, 1);
+    if (prefs.layers.rain) { ctx.globalAlpha = a; ctx.drawImage(tl.rainCv, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0); }
+    if (prefs.layers.flood) {
+      ctx.globalCompositeOperation = T.dark ? "lighter" : "source-over";
+      ctx.globalAlpha = 0.95 * a;
+      ctx.drawImage(tl.rasCv, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+      ctx.globalCompositeOperation = "source-over";
+    }
+    ctx.globalAlpha = 1;
+  }
+  // streets
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  const minor = region ? 1 : clamp((V.k - 0.04) / 0.12, 0, 1);  // fade in residential streets as you zoom in
+  const wz = region ? Math.max(zw, 0.9) : zw;
+  for (const tl of tiles) {
+    const a = clamp((now - tl.born) / 500, 0, 1);
+    for (let c = 2; c >= 0; c--) {
+      const al = (c === 2 ? minor : 1) * a;
+      if (al <= 0.02) continue;
+      ctx.globalAlpha = al;
+      if (T.casing !== "transparent" && V.k > 0.06) { ctx.strokeStyle = T.casing; ctx.lineWidth = (BW[c] * wz + 1.3) * px; ctx.stroke(tl.base[c]); }
+    }
+    for (let c = 2; c >= 0; c--) {
+      const al = (c === 2 ? minor : 1) * a;
+      if (al <= 0.02) continue;
+      ctx.globalAlpha = al; ctx.strokeStyle = T.s[c]; ctx.lineWidth = BW[c] * wz * px; ctx.stroke(tl.base[c]);
+    }
+  }
+  ctx.globalAlpha = 1;
+  if (!prefs.layers.flood) return;
+  for (const tl of tiles) {
+    if (!tl.fc) continue;
+    const a = clamp((now - (tl.fcBorn || 0)) / 700, 0, 1);
+    for (const [lvl, b] of buildWet(tl)) {
+      const c = waterRGB(b.d), al = clamp(0.3 + lvl / 6, 0.3, 1) * a;
+      if (lvl >= 3) { ctx.strokeStyle = `rgba(${c},${al * 0.22})`; ctx.lineWidth = (b.w + 6) * wz * px; ctx.stroke(b.p); }
+      ctx.strokeStyle = `rgba(${c},${al})`; ctx.lineWidth = (b.w + 1.1) * wz * px; ctx.stroke(b.p);
+    }
   }
 }
-
-function drawClosures(px, zw, bw) {
+function drawClosures(px, zw) {
+  if (!prefs.layers.closures || V.k < 0.08) return;
   const closed = new Path2D(), cons = new Path2D(), subwayShut = new Path2D(), subway = new Path2D();
   let any = false;
-  for (const i of S.closedSegs) { if (G.segs[i]) { segPath(G.segs[i], G.segs[i].construction ? cons : closed); any = true; } }
-  for (const sg of G.segs) {
-    if (!sg.underpass) continue;
-    any = true;
-    if (depthAt(sg.i, S.t) >= 30) segPath(sg, subwayShut); else segPath(sg, subway);
+  for (const gid of S.closedSegs) { const sg = SEGS.get(gid); if (sg) { segPath(sg, sg.construction ? cons : closed); any = true; } }
+  for (const tl of visibleTiles()) {
+    if (tl.lod !== "detail") continue;
+    for (const sg of tl.segs) {
+      if (!sg.underpass) continue;
+      any = true;
+      if (depthAt(sg, S.t) >= 30) segPath(sg, subwayShut); else segPath(sg, subway);
+    }
   }
   if (!any) return;
   ctx.setLineDash([2 * px, 3 * px]); ctx.strokeStyle = T.alt; ctx.lineWidth = 3 * zw * px; ctx.stroke(cons);
   ctx.setLineDash([3 * px, 2.5 * px]); ctx.strokeStyle = rgb(T.w[2]); ctx.lineWidth = 3.4 * zw * px; ctx.stroke(closed); ctx.stroke(subwayShut);
-  ctx.setLineDash([]); ctx.strokeStyle = T.dark ? "rgba(255,255,255,.5)" : "rgba(30,40,40,.55)"; ctx.lineWidth = (bw[1] + 2.4) * zw * px;
+  ctx.setLineDash([]); ctx.strokeStyle = T.dark ? "rgba(255,255,255,.5)" : "rgba(10,10,10,.5)"; ctx.lineWidth = (BW[1] + 2.4) * zw * px;
   ctx.globalAlpha = 0.5; ctx.stroke(subway); ctx.globalAlpha = 1;
 }
 function drawClosureMarks() {
-  if (!prefs.layers.closures || V.k / V.fitK < 1.4) return;
+  if (!prefs.layers.closures || V.k < 0.4) return;
   const mark = (sg, col) => {
     const [sx, sy] = toScreen(sg.mx, sg.my);
     if (sx < -10 || sy < -10 || sx > W + 10 || sy > H + 10) return;
     ctx.fillStyle = col; ctx.strokeStyle = "#fff"; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.arc(sx, sy, 7, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-    ctx.fillStyle = "#fff"; ctx.fillRect(sx - 4, sy - 1.3, 8, 2.6);  // no-entry bar
+    ctx.fillStyle = "#fff"; ctx.fillRect(sx - 4, sy - 1.3, 8, 2.6);
   };
-  for (const i of S.closedSegs) if (G.segs[i]) mark(G.segs[i], G.segs[i].construction ? T.alt : rgb(T.w[2]));
-  for (const sg of G.segs) if (sg.underpass && depthAt(sg.i, S.t) >= 30) mark(sg, rgb(T.w[2]));
+  for (const gid of S.closedSegs) { const sg = SEGS.get(gid); if (sg) mark(sg, sg.construction ? T.alt : rgb(T.w[2])); }
+  for (const tl of visibleTiles()) if (tl.lod === "detail") for (const sg of tl.segs) if (sg.underpass && depthAt(sg, S.t) >= 30) mark(sg, rgb(T.w[2]));
 }
 
 /* routes */
@@ -424,33 +598,33 @@ function routePath(coords) {
 function chosen() { const P = S.plan; return P && P.dry && S.sel !== "usual" ? "dry" : "usual"; }
 let routeCache = { key: null };
 function drawRoutes(px, zw) {
-  const P = S.plan, key = `${P.run_id}|${P.mode}|${P.depart_min}|${P.trip?.to}|${P.trip?.from}`;
+  const P = S.plan, key = `${P.run_id}|${P.mode}|${P.depart_min}|${P.trip?.to}|${P.trip?.from}|${SEGS.size}`;
   if (routeCache.key !== key) {
     const wet = (prof) => {
       const out = { amber: new Path2D(), red: new Path2D() };
-      for (const [si, d] of prof) { if (d >= P.limit_cm) segPath(G.segs[si], out.red); else if (d >= P.limit_cm * 0.6) segPath(G.segs[si], out.amber); }
+      for (const [gid, d] of prof) { const sg = SEGS.get(gid); if (!sg) continue; if (d >= P.limit_cm) segPath(sg, out.red); else if (d >= P.limit_cm * 0.6) segPath(sg, out.amber); }
       return out;
     };
     routeCache = { key, usual: routePath(P.usual.coords), uw: wet(P.usual.profile), dry: P.dry ? routePath(P.dry.coords) : null, dw: P.dry ? wet(P.dry.profile) : null };
   }
-  const R = routeCache, sel = chosen();
-  const paint = (path, w, on) => {
+  const R = routeCache, sel = chosen(), w = Math.max(zw, 0.8);
+  const paint = (path, wt, on) => {
     if (on) {
       ctx.setLineDash([]);
-      ctx.strokeStyle = T.routeCasing; ctx.lineWidth = 6.5 * zw * px; ctx.stroke(path);
-      ctx.strokeStyle = T.accent; ctx.lineWidth = 4.2 * zw * px; ctx.stroke(path);
+      ctx.strokeStyle = T.routeCasing; ctx.lineWidth = 8 * w * px; ctx.stroke(path);
+      ctx.strokeStyle = T.accent; ctx.lineWidth = 5 * w * px; ctx.stroke(path);
     } else {
       ctx.setLineDash([5 * px, 5 * px]);
-      ctx.strokeStyle = T.alt; ctx.lineWidth = 2.6 * zw * px; ctx.stroke(path);
+      ctx.strokeStyle = T.alt; ctx.lineWidth = 2.8 * w * px; ctx.stroke(path);
       ctx.setLineDash([]);
     }
-    ctx.strokeStyle = rgb(T.w[1]); ctx.lineWidth = (on ? 4.2 : 3) * zw * px; ctx.stroke(w.amber);
-    ctx.strokeStyle = rgb(T.w[2]); ctx.lineWidth = (on ? 4.6 : 3.4) * zw * px; ctx.stroke(w.red);
+    ctx.strokeStyle = rgb(T.w[1]); ctx.lineWidth = (on ? 5 : 3.2) * w * px; ctx.stroke(wt.amber);
+    ctx.strokeStyle = rgb(T.w[2]); ctx.lineWidth = (on ? 5.6 : 3.6) * w * px; ctx.stroke(wt.red);
   };
   if (sel === "dry") { paint(R.usual, R.uw, false); paint(R.dry, R.dw, true); }
   else { if (R.dry) paint(R.dry, R.dw, false); paint(R.usual, R.uw, true); }
   ctx.setLineDash([1 * px, 14 * px]); ctx.lineDashOffset = dash * px * 6;
-  ctx.strokeStyle = T.dark ? "rgba(6,32,22,.75)" : "rgba(255,255,255,.85)"; ctx.lineWidth = 2 * zw * px;
+  ctx.strokeStyle = T.dark ? "rgba(0,0,0,.7)" : "rgba(255,255,255,.9)"; ctx.lineWidth = 2.2 * w * px;
   ctx.stroke(sel === "dry" ? R.dry : R.usual);
   ctx.setLineDash([]); ctx.lineDashOffset = 0;
 }
@@ -459,20 +633,20 @@ function drawRouteMarkers(ts) {
   if (tr.from_label !== "Your location") startDot(...proj(a[0], a[1]));
   dropPin(...proj(b[0], b[1]));
   const route = chosen() === "dry" ? P.dry : P.usual, w = route?.worst;
-  if (w && w.depth >= P.limit_cm * 0.6) { const sg = G.segs[w.seg]; ring(sg.mx, sg.my, `${w.depth} cm`, ts, w.depth >= P.limit_cm ? T.w[2] : T.w[1]); }
+  if (w && w.depth >= P.limit_cm * 0.6) { const sg = SEGS.get(w.seg); if (sg) ring(sg.mx, sg.my, `${w.depth} cm`, ts, w.depth >= P.limit_cm ? T.w[2] : T.w[1]); }
 }
 function startDot(x, y) {
   const [sx, sy] = toScreen(x, y);
-  ctx.fillStyle = T.dark ? "#0b1215" : "#fff"; ctx.strokeStyle = T.text; ctx.lineWidth = 3;
+  ctx.fillStyle = T.dark ? "#000" : "#fff"; ctx.strokeStyle = T.text; ctx.lineWidth = 3.5;
   ctx.beginPath(); ctx.arc(sx, sy, 6.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
 }
 function dropPin(x, y) {
   const [sx, sy] = toScreen(x, y);
   ctx.save(); ctx.translate(sx, sy);
   ctx.shadowColor = "rgba(0,0,0,.35)"; ctx.shadowBlur = 6; ctx.shadowOffsetY = 2;
-  ctx.fillStyle = rgb(T.w[2]);
+  ctx.fillStyle = T.text;
   ctx.beginPath(); ctx.moveTo(0, 0); ctx.bezierCurveTo(-3, -9, -11, -14, -11, -23); ctx.arc(0, -23, 11, Math.PI, 0); ctx.bezierCurveTo(11, -14, 3, -9, 0, 0); ctx.fill();
-  ctx.shadowColor = "transparent"; ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(0, -23, 4.2, 0, Math.PI * 2); ctx.fill();
+  ctx.shadowColor = "transparent"; ctx.fillStyle = T.dark ? "#000" : "#fff"; ctx.beginPath(); ctx.arc(0, -23, 4.2, 0, Math.PI * 2); ctx.fill();
   ctx.restore();
 }
 function ring(x, y, label, ts, col = T.w[2]) {
@@ -484,11 +658,11 @@ function ring(x, y, label, ts, col = T.w[2]) {
   ctx.fillStyle = rgb(col); ctx.strokeStyle = "#fff"; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.arc(sx, sy, 5.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
   if (label) {
-    ctx.font = "600 12.5px 'Instrument Sans', system-ui, sans-serif"; ctx.textAlign = "left";
+    ctx.font = `800 12.5px ${FONT}`; ctx.textAlign = "left";
     const tw = ctx.measureText(label).width;
-    ctx.fillStyle = T.dark ? "rgba(18,27,31,.95)" : "rgba(255,255,255,.96)";
-    roundRect(sx + 10, sy - 11, tw + 14, 22, 11); ctx.fill();
-    ctx.fillStyle = rgb(col); ctx.fillText(label, sx + 17, sy + 4.5);
+    ctx.fillStyle = rgb(col);
+    roundRect(sx + 10, sy - 11, tw + 14, 22, 6); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.fillText(label, sx + 17, sy + 4.5);
   }
 }
 function roundRect(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
@@ -501,28 +675,35 @@ function drawRain(dt) {
     if (d.x < 0) d.x += 1;
     const sx = d.x * W, sy = d.y * H, [wx, wy] = toWorld(sx, sy), I = rainAt(S.t, wx, wy);
     if (I < 8) continue;
-    ctx.strokeStyle = `rgba(${T.rain},${clamp((I - 8) / 70, 0, 1) * (T.dark ? 0.35 : 0.45)})`;
+    ctx.strokeStyle = `rgba(${T.rain},${clamp((I - 8) / 70, 0, 1) * (T.dark ? 0.4 : 0.45)})`;
     ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx + d.l * 0.3, sy - d.l); ctx.stroke();
   }
 }
-function drawStreetLabels() {
-  const z = V.k / V.fitK;
-  if (z < 1.7) return;
-  const maxCls = z < 2.6 ? 0 : z < 4 ? 1 : 2, placed = [];
+function drawStreetLabels(tiles) {
+  const k = V.k;
+  if (k < 0.12) return;
+  const maxCls = k < 0.3 ? 0 : k < 0.6 ? 1 : 2, placed = [];
   let n = 0;
   ctx.textAlign = "center"; ctx.textBaseline = "middle";
-  for (const L of G.labels) {
-    if (L.cls > maxCls || n > 70) continue;
+  const all = [];
+  for (const tl of tiles) for (const L of tl.labels) if (L.cls <= maxCls) all.push(L);
+  all.sort((p, q) => p.cls - q.cls || q.sg.len - p.sg.len);
+  const seen = new Set();
+  for (const L of all) {
+    if (n > 70) break;
     const sg = L.sg, pts = sg.pts, m = Math.floor(pts.length / 4) * 2;
-    const ia = Math.max(0, m - 2), ib = Math.min(pts.length - 2, m + 2);
-    const [ax, ay] = toScreen(pts[ia], pts[ia + 1]), [bx, by] = toScreen(pts[ib], pts[ib + 1]), [sx, sy] = toScreen(sg.mx, sg.my);
+    const [sx, sy] = toScreen(sg.mx, sg.my);
     if (sx < 20 || sy < 20 || sx > W - 20 || sy > H - 20) continue;
-    ctx.font = `${L.cls === 0 ? 600 : 500} ${L.cls === 0 ? 12.5 : 11.5}px 'Instrument Sans', system-ui, sans-serif`;
+    const near = `${L.name}|${Math.round(sx / 220)}|${Math.round(sy / 220)}`;
+    if (seen.has(near)) continue;
+    const ia = Math.max(0, m - 2), ib = Math.min(pts.length - 2, m + 2);
+    const [ax, ay] = toScreen(pts[ia], pts[ia + 1]), [bx, by] = toScreen(pts[ib], pts[ib + 1]);
+    ctx.font = `${L.cls === 0 ? 700 : 600} ${L.cls === 0 ? 12.5 : 11.5}px ${FONT}`;
     const tw = ctx.measureText(L.name).width;
-    if (sg.len * V.k < tw * 1.15) continue;
+    if (sg.len * k < tw * 1.1) continue;
     const box = [sx - tw / 2 - 6, sy - 9, sx + tw / 2 + 6, sy + 9];
     if (placed.some((p) => !(box[2] < p[0] || box[0] > p[2] || box[3] < p[1] || box[1] > p[3]))) continue;
-    placed.push(box); n++;
+    placed.push(box); n++; seen.add(near);
     let ang = Math.atan2(by - ay, bx - ax);
     if (ang > Math.PI / 2) ang -= Math.PI; if (ang < -Math.PI / 2) ang += Math.PI;
     ctx.save(); ctx.translate(sx, sy); ctx.rotate(ang);
@@ -532,16 +713,19 @@ function drawStreetLabels() {
   }
   ctx.textBaseline = "alphabetic";
 }
-function drawLocalityLabels() {
-  const z = V.k / V.fitK;
-  ctx.font = "600 10.5px 'Instrument Sans', system-ui, sans-serif"; ctx.textAlign = "center";
-  if ("letterSpacing" in ctx) ctx.letterSpacing = "1.5px";
-  for (const L of G.locs) {
+function drawLocalityLabels(tiles) {
+  ctx.font = `800 10.5px ${FONT}`; ctx.textAlign = "center";
+  if ("letterSpacing" in ctx) ctx.letterSpacing = "1.6px";
+  const placed = [];
+  for (const tl of tiles) for (const L of tl.locs || []) {
     const [sx, sy] = toScreen(...L.xy);
     if (sx < 0 || sy < 0 || sx > W || sy > H) continue;
-    ctx.globalAlpha = (z > 4 ? 0.5 : 0.85) * S.intro;
-    ctx.lineWidth = 3; ctx.strokeStyle = T.halo; ctx.strokeText(L.name.toUpperCase(), sx, sy);
-    ctx.fillStyle = T.locality; ctx.fillText(L.name.toUpperCase(), sx, sy);
+    const t = L.name.toUpperCase(), w = ctx.measureText(t).width, box = [sx - w / 2 - 8, sy - 10, sx + w / 2 + 8, sy + 6];
+    if (placed.some((p) => !(box[2] < p[0] || box[0] > p[2] || box[3] < p[1] || box[1] > p[3]))) continue;
+    placed.push(box);
+    ctx.globalAlpha = V.k > 1 ? 0.5 : 0.9;
+    ctx.lineWidth = 3; ctx.strokeStyle = T.halo; ctx.strokeText(t, sx, sy);
+    ctx.fillStyle = T.locality; ctx.fillText(t, sx, sy);
   }
   ctx.globalAlpha = 1;
   if ("letterSpacing" in ctx) ctx.letterSpacing = "0px";
@@ -591,15 +775,16 @@ const endPtr = (e) => {
       if (now - lastTap < 300) { zoomAt(e.clientX, e.clientY, 2, true); lastTap = 0; }
       else { lastTap = now; const x = e.clientX, y = e.clientY; setTimeout(() => { if (lastTap === now) tapAt(x, y); }, 280); }
     }
-    if (moved && S.view === "home") scheduleNearby();
+    if (moved) { sendFocus(); if (S.view === "home") scheduleNearby(); }
     drag = null;
   }
 };
 cv.addEventListener("pointerup", endPtr); cv.addEventListener("pointercancel", endPtr);
-cv.addEventListener("pointerleave", () => { S.hover = -1; $("#tip").hidden = true; });
-cv.addEventListener("wheel", (e) => { e.preventDefault(); anim.to = null; zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0016)); }, { passive: false });
+cv.addEventListener("pointerleave", () => { S.hover = null; $("#tip").hidden = true; });
+let wheelT = null;
+cv.addEventListener("wheel", (e) => { e.preventDefault(); anim.to = null; zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0016)); clearTimeout(wheelT); wheelT = setTimeout(() => { sendFocus(); scheduleNearby(); }, 300); }, { passive: false });
 function zoomAt(sx, sy, f, animate) {
-  const [wx, wy] = toWorld(sx, sy), k = clamp(V.k * f, V.fitK * 0.6, V.fitK * 24);
+  const [wx, wy] = toWorld(sx, sy), k = clamp(V.k * f, K_MIN, K_MAX);
   const to = { cx: wx - (sx - W / 2) / k, cy: wy - (sy - H / 2) / k, k };
   if (animate) Object.assign(anim, { from: { ...V }, to, t0: performance.now(), dur: 300 }); else Object.assign(V, to);
 }
@@ -607,12 +792,16 @@ $("#zin").onclick = () => zoomAt(W / 2, H / 2, 1.8, true);
 $("#zout").onclick = () => zoomAt(W / 2, H / 2, 1 / 1.8, true);
 function hit(sx, sy, rpx = 12) {
   const [wx, wy] = toWorld(sx, sy), r = rpx / V.k;
-  let best = -1, bd = r;
-  const c0 = Math.floor((wx - r) / G.cell), c1 = Math.floor((wx + r) / G.cell), r0 = Math.floor((wy - r) / G.cell), r1 = Math.floor((wy + r) / G.cell);
-  for (let cx = c0; cx <= c1; cx++) for (let cy = r0; cy <= r1; cy++) {
-    for (const i of G.hash.get(`${cx},${cy}`) || []) {
-      const p = G.segs[i].pts;
-      for (let q = 0; q < p.length - 2; q += 2) { const d = distSeg(wx, wy, p[q], p[q + 1], p[q + 2], p[q + 3]); if (d < bd) { bd = d; best = i; } }
+  let best = null, bd = r;
+  for (const tl of visibleTiles()) {
+    if (tl.lod === "region" && showDetail() && tileAt(wx, wy, "detail")) continue;
+    if (tl.lod === "detail" && !showDetail()) continue;
+    const C = tl.CELL;
+    for (let cx = Math.floor((wx - r) / C); cx <= Math.floor((wx + r) / C); cx++) for (let cy = Math.floor((wy - r) / C); cy <= Math.floor((wy + r) / C); cy++) {
+      for (const i of tl.hash.get(cx + "," + cy) || []) {
+        const p = tl.segs[i].pts;
+        for (let q = 0; q < p.length - 2; q += 2) { const d = distSeg(wx, wy, p[q], p[q + 1], p[q + 2], p[q + 3]); if (d < bd) { bd = d; best = tl.segs[i].gid; } }
+      }
     }
   }
   return best;
@@ -622,25 +811,25 @@ function distSeg(px, py, ax, ay, bx, by) {
   return Math.hypot(px - ax - t * dx, py - ay - t * dy);
 }
 function hoverAt(sx, sy) {
-  const i = hit(sx, sy, 9); S.hover = i;
+  const gid = hit(sx, sy, 9); S.hover = gid;
   const tip = $("#tip");
-  if (i < 0) { tip.hidden = true; return; }
-  const d = Math.round(depthAt(i, S.t));
-  tip.innerHTML = `${esc(G.segs[i].name)}<b class="num" style="color:${d >= 6 ? rgb(waterRGB(d)) : "var(--faint)"}">${d >= 6 ? d + " cm" : "dry"}</b>`;
+  if (!gid) { tip.hidden = true; return; }
+  const d = Math.round(depthAt(gid, S.t));
+  tip.innerHTML = `${esc(SEGS.get(gid).name)}<b class="num">${d >= 6 ? d + " cm" : "dry"}</b>`;
   tip.hidden = false;
   tip.style.left = Math.min(sx + 14, W - tip.offsetWidth - 8) + "px"; tip.style.top = (sy + 16) + "px";
 }
 function tapAt(sx, sy) {
-  const i = hit(sx, sy, 16);
-  if (i >= 0) openPlace({ seg: i });
+  const gid = hit(sx, sy, 16);
+  if (gid) openPlace({ gid });
   else if (S.view === "place") back();
 }
 
 /* ------------------------------------------------------------ timeline */
 const track = $("#track");
 function renderTimeline() {
-  if (!S.fc || !S.area) return;
-  $("#tl-sub").textContent = S.fc.label.replace("Demo storm · ", "");
+  if (!S.sum) return;
+  $("#tl-sub").textContent = S.sum.label.replace("Demo · ", "");
   $("#tl-sub").classList.toggle("fresh", S.fresh);
   const dm = $("#depart-mark");
   dm.hidden = S.view !== "dir";
@@ -650,12 +839,12 @@ function renderTimeline() {
 }
 let lastFrameIdx = -1;
 function renderHead() {
-  if (!S.fc) return;
+  if (!S.sum) return;
   $("#head").style.left = (S.t / 360 * 100) + "%";
   $("#tl-time").textContent = S.t < 5 ? `Now ${clockAt(0)}` : clockAt(S.t);
   track.setAttribute("aria-valuenow", Math.round(S.t)); track.setAttribute("aria-valuetext", clockAt(S.t));
-  const f = clamp(Math.round(S.t / 10), 0, S.fc.n - 1);
-  $("#tl-rain").textContent = `${S.fc.rain_mean[f]} mm/h`;
+  const f = clamp(Math.round(S.t / 10), 0, S.sum.rain_mean.length - 1);
+  $("#tl-rain").textContent = `${S.sum.rain_mean[f]} mm/h`;
   if (f !== lastFrameIdx) { lastFrameIdx = f; renderBars(); }
 }
 function renderBars() {
@@ -663,10 +852,10 @@ function renderBars() {
   if (!r.width) return;
   if (hc.width !== Math.round(r.width * DPR)) { hc.width = Math.round(r.width * DPR); hc.height = Math.round(r.height * DPR); }
   const c = hc.getContext("2d"); c.setTransform(DPR, 0, 0, DPR, 0, 0); c.clearRect(0, 0, r.width, r.height);
-  const n = S.fc.rain_mean.length, bw = r.width / n;
-  S.fc.rain_mean.forEach((v, i) => {
+  const n = S.sum.rain_mean.length, bw = r.width / n, [cr, cg, cb] = T.w[1];
+  S.sum.rain_mean.forEach((v, i) => {
     const h = clamp(v / 90, 0.08, 1) * r.height, past = i * 10 <= S.t;
-    c.fillStyle = `rgba(${T.rain},${past ? 0.75 : 0.28})`;
+    c.fillStyle = `rgba(${cr},${cg},${cb},${past ? 0.95 : 0.3})`;
     c.fillRect(i * bw + 0.5, r.height - h, Math.max(1, bw - 1.5), h);
   });
 }
@@ -701,9 +890,9 @@ const sheet = $("#sheet");
 const SH = { snap: "half" };
 function snapHeights() {
   const peekEl = $(".peek", sheet);
-  const peek = Math.round(Math.min(H * 0.42, (peekEl ? peekEl.offsetHeight : 76) + 26 + 8));
+  const peek = Math.round(Math.min(H * 0.42, (peekEl ? peekEl.offsetHeight : 76) + 24 + 8));
   const top = parseFloat(getComputedStyle(root).getPropertyValue("--sat")) || 0;
-  return { peek, half: Math.round(H * 0.46), full: Math.round(H - 74 - top) };
+  return { peek, half: Math.round(H * 0.44), full: Math.round(H - 76 - top) };
 }
 function applySheet(px) {
   if (isDesk()) {
@@ -724,7 +913,7 @@ sheet.addEventListener("pointerdown", (e) => {
   if (isDesk()) return;
   const onHandle = e.target.closest(".grab, .vhead") || (e.target.closest(".peek") && !e.target.closest("button,a,select,input"));
   if (!onHandle && SH.snap !== "peek") return;
-  sd = { y: e.clientY, h: snapHeights()[SH.snap], t: performance.now(), id: e.pointerId, moved: false, onHandle: !!onHandle };
+  sd = { y: e.clientY, h: snapHeights()[SH.snap], t: performance.now(), id: e.pointerId, moved: false };
 });
 sheet.addEventListener("pointermove", (e) => {
   if (!sd || e.pointerId !== sd.id) return;
@@ -760,7 +949,7 @@ function go(view, snap) {
 }
 function back() {
   sugg.hidden = true;
-  if (S.view === "dir") { S.plan = null; S.advice = null; routeCache.key = null; }
+  if (S.view === "dir") { S.plan = null; S.advice = null; S.planWait = null; routeCache.key = null; }
   S.view = stack.pop() || "home";
   if (S.view === "dir" && !S.plan) S.view = "home";
   if (S.view === "home") { qEl.value = ""; $("#q-clear").hidden = true; S.searchFor = "dest"; S.depart = S.persona?.depart_min ?? 0; scheduleNearby(); }
@@ -768,18 +957,25 @@ function back() {
   setSnap("half");
 }
 $("#s-back").onclick = back;
-
+let viewsTimer = null;
+function maybeRefreshViews() {
+  clearTimeout(viewsTimer);
+  viewsTimer = setTimeout(() => { if (S.view === "home" && !sd) render(); }, 600);
+}
 function render() {
-  if (!S.area) return;
-  const body = $("#sheet-body"), v = S.view;
+  if (!S.cfg) return;
+  const body = $("#sheet-body"), v = S.view, scroll = body.scrollTop;
   $("#s-back").hidden = v === "home";
   $("#s-brand").hidden = v !== "home";
-  if (v === "home") body.innerHTML = S.user === "priya" ? homeView() : opsView();
-  if (v === "place") body.innerHTML = placeView();
-  if (v === "dir") body.innerHTML = dirView();
-  if (v === "commute") body.innerHTML = commuteView();
-  if (v === "report") body.innerHTML = reportView();
-  wire(body);
+  const html = v === "home" ? (S.user === "priya" ? homeView() : opsView()) : v === "place" ? placeView() : v === "dir" ? dirView()
+    : v === "commute" ? commuteView() : v === "report" ? reportView() : "";
+  if (html !== render.last) {  // never replace the DOM under someone's finger for nothing
+    render.last = html;
+    body.innerHTML = html;
+    body.scrollTop = render.lastView === v ? scroll : 0;
+    render.lastView = v;
+    wire(body);
+  }
   applySheet();
   renderTimeline();
 }
@@ -787,7 +983,6 @@ function render() {
 const ICON = {
   home: `<svg viewBox="0 0 24 24"><path d="M4 11 12 4l8 7v8a1 1 0 0 1-1 1h-4v-5H9v5H5a1 1 0 0 1-1-1z"/></svg>`,
   trip: `<svg viewBox="0 0 24 24"><path d="M4 18h16M6 18l2-7h8l2 7M9 11l1-4h4l1 4"/></svg>`,
-  work: `<svg viewBox="0 0 24 24"><rect x="4" y="8" width="16" height="11" rx="2"/><path d="M9 8V6a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`,
   pin: `<svg viewBox="0 0 24 24"><path d="M12 21s-6-5.5-6-11a6 6 0 0 1 12 0c0 5.5-6 11-6 11z"/><circle cx="12" cy="10" r="2.2"/></svg>`,
   street: `<svg viewBox="0 0 24 24"><path d="M8 3 6 21M16 3l2 18M12 5v2M12 11v2M12 17v2"/></svg>`,
   locality: `<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5"/></svg>`,
@@ -798,57 +993,88 @@ const ICON = {
   go: `<svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>`,
   dir: `<svg viewBox="0 0 24 24"><path d="M12 3 21 12 12 21 3 12z"/><path d="M10 14v-3h4M12.5 9l2 2-2 2"/></svg>`,
   swap: `<svg viewBox="0 0 24 24"><path d="M7 4v16M7 4 4 7M7 4l3 3M17 20V4M17 20l-3-3M17 20l3-3"/></svg>`,
+  storm: `<svg viewBox="0 0 24 24"><path d="M7 15a4 4 0 1 1 1-7.9A5 5 0 0 1 18 9a3 3 0 0 1 0 6zM9 18l-1 2M13 18l-1 2M17 18l-1 2"/></svg>`,
 };
 function depthMeter(d) { return `<span class="meter"><i style="width:${clamp(d / 80 * 100, 3, 100)}%;background:${rgb(waterRGB(Math.max(1, d)))}"></i></span>`; }
 const SHIM = `<span class="shimmer"></span><span class="shimmer" style="width:62%"></span>`;
+const prepBox = (msg) => `<div class="prep"><span class="spin"></span><span>${esc(msg)}</span></div>`;
 
 /* home */
+function coverageCard() {
+  const p = S.progress;
+  if (!p) return "";
+  const d = p.detail, r = p.region;
+  const dReady = d.ready + d.empty, rReady = r.ready + r.empty;
+  if (dReady >= d.tiles && rReady >= r.tiles && d.forecast >= d.ready) return "";
+  const cell = (b, sub, a, n) => `<div><b>${b}</b><span>${sub}</span><span class="bar"><i style="width:${n ? Math.round(a / n * 100) : 100}%"></i></span></div>`;
+  return `<div class="sec"><div class="sec-h">Loading in the background<small>you can use the map now</small></div>
+    <div class="coverage">${cell("Every street", `${dReady}/${d.tiles} tiles · ${d.km} km around ${S.me ? "you" : "here"}`, dReady, d.tiles)}${cell("Main roads", `${rReady}/${r.tiles} tiles · ${r.km} km around ${S.me ? "you" : "here"}`, rReady, r.tiles)}</div></div>`;
+}
 function homeView() {
-  const P = S.commute, per = S.persona;
+  const P = S.commute, per = S.persona, demo = S.sum?.mode === "demo";
   let peek = `<div class="peek sec">${SHIM}</div>`;
-  if (S.personaLoaded && !per) {
+  if (demo && !per && S.demo?.state === "preparing") {
+    peek = `<div class="peek sec"><div class="commute"><span class="ico">${ICON.storm}</span><span class="t">Setting up the demo</span>
+      <span class="d"><span class="spin"></span></span><span class="s">Running both nowcasts on the streets around you and picking a commute</span></div></div>`;
+  } else if (S.personaLoaded && !per) {
     peek = `<div class="peek sec"><button class="commute" data-act="edit-commute"><span class="ico">${ICON.home}</span><span class="t">Set your commute</span>
-      <span class="d"><span class="pill watch">Not set</span></span><span class="s">Save home, work and when you leave. We'll warn you before your route floods.</span></button></div>`;
+      <span class="d"><span class="pill watch">Not set</span></span><span class="s">Home, work and when you leave. We warn you before your route floods.</span></button></div>`;
   } else if (per && per.in_window === false) {
     peek = `<div class="peek sec"><button class="commute" data-act="commute"><span class="ico">${ICON.home}</span><span class="t">Home at ${esc(per.depart_label || per.leave)}</span>
       <span class="d"><span class="pill clear">Later</span></span><span class="s">${esc(per.from_label)} → ${esc(per.to_label)} · forecast covers the next 6 hours</span></button></div>`;
+  } else if (per && S.commuteWait) {
+    peek = `<div class="peek sec"><button class="commute" data-act="commute"><span class="ico">${ICON.home}</span><span class="t">Home at ${esc(clockAt(per.depart_min))}</span>
+      <span class="d"><span class="spin"></span></span><span class="s">${esc(S.commuteWait)}</span></button></div>`;
   } else if (P && per) {
-    const w = P.usual.worst, st = P.status, isTrip = per.name === "You";
+    const w = P.usual.worst, st = P.status;
     peek = `<div class="peek sec"><button class="commute" data-act="commute">
-      <span class="ico">${S.area.area_id === "trip" ? ICON.trip : ICON.home}</span>
-      <span class="t">${S.area.area_id === "trip" ? `Your trip to ${esc(per.to_label)}` : `Home at ${esc(clockAt(per.depart_min))}`}</span>
-      <span class="d"><b class="num">${w ? w.depth : 0}<small style="font-size:13px;font-weight:500"> cm</small></b><span class="pill ${st}">${st === "alert" ? "Flooded" : st === "watch" ? "Watch" : "Clear"}</span></span>
+      <span class="ico">${ICON.home}</span>
+      <span class="t">Home at ${esc(clockAt(per.depart_min))}</span>
+      <span class="d"><b class="num">${w ? w.depth : 0}<small> cm</small></b><span class="pill ${st}">${st === "alert" ? "Flooded" : st === "watch" ? "Watch" : "Clear"}</span></span>
       <span class="s">${esc(per.from_label)} → ${esc(per.to_label)} · ${esc(modeLabel(S.mode))}</span>
     </button></div>`;
   }
-  const anchorMe = S.me && S.meInside, near = S.nearby;
+  const near = S.nearby, anchorMe = !!S.me;
   const nearList = !near ? SHIM
-    : near.streets.length ? `<div class="list">${near.streets.map((r) => `<button class="li" data-seg="${r.seg_id}"><span class="n">${esc(r.name)}</span><span class="d num" style="color:${rgb(waterRGB(r.depth_cm))}">${r.depth_cm} cm</span><span class="s">${esc(r.locality)}</span>${depthMeter(r.depth_cm)}</button>`).join("")}</div>`
-    : `<div class="empty">No streets above 15 cm ${anchorMe ? "near you" : "in this part of the map"} at ${esc(clockAt(S.t))}.</div>`;
-  const fc = S.fc;
+    : near.streets.length ? `<div class="list">${near.streets.map((r) => `<button class="li" data-gid="${esc(r.seg_id)}"><span class="n">${esc(r.name)}</span><span class="d num" style="color:${rgb(waterRGB(r.depth_cm))}">${r.depth_cm} cm</span><span class="s">${esc(r.locality)}</span>${depthMeter(r.depth_cm)}</button>`).join("")}</div>`
+    : `<div class="empty">No streets above 15 cm ${anchorMe ? "near you" : "here"} at ${esc(clockAt(S.t))}.</div>`;
+  const fc = S.sum;
+  if (!fc) return peek;
   let peakI = 0; fc.rain_mean.forEach((v, i) => { if (v > fc.rain_mean[peakI]) peakI = i; });
-  let worstF = 0, worstN = 0;
-  for (let f = 0; f < fc.n; f++) { let c = 0; for (let i = 0; i < fc.nseg; i++) if (fc.seg[f * fc.nseg + i] >= limit()) c++; if (c > worstN) { worstN = c; worstF = f; } }
-  const a = S.area, short = (t) => clockAt(t).replace(" PM", "").replace(" AM", "");
+  const { worstF, worstN } = worstMoment();
+  const short = (t) => clockAt(t).replace(" PM", "").replace(" AM", "");
+  const live = fc.mode === "live";
   return `${peek}
-    <div class="sec"><div class="sec-h">Flooding ${anchorMe ? "near you" : "in view"}<small>at ${esc(clockAt(S.t))}</small></div>${nearList}</div>
-    <div class="sec"><div class="sec-h">Next 6 hours<small>${S.fc.mode === "live" && !S.fc.label.includes("unavailable") ? '<span class="live-dot"></span>live' : esc(S.fc.mode === "demo" ? "demo storm" : S.fc.mode === "replay" ? "replay" : "live rain unavailable")}</small></div>
-      ${fc.total_mm < 1 ? `<div class="empty">No rain expected in the next 6 hours. ${S.fc.mode === "live" ? "The forecast refreshes every 15 minutes." : ""}</div>` : ""}
+    <div class="sec"><div class="sec-h">Flooding ${anchorMe ? "near you" : "here"}<small>at ${esc(clockAt(S.t))}</small></div>${nearList}</div>
+    <div class="sec"><div class="sec-h">Next 6 hours<small>${live ? '<span class="live-dot"></span>live' : esc(fc.mode === "demo" ? "demo storm" : "replay")}</small></div>
+      ${fc.total_mm < 1 ? `<div class="empty">No rain expected here in the next 6 hours.${live ? " The forecast refreshes every 15 minutes. Try the demo storm in How it works." : ""}</div>` : ""}
       ${contextLines()}
-      <div class="kv2"><div><b class="num">${fc.total_mm}</b><span>mm of rain</span></div><div><b class="num">${esc(short(fc.times[peakI]))}</b><span>heaviest rain</span></div><div><b class="num">${worstN}</b><span>streets over ${limit()} cm at worst</span></div></div>
-      <button class="btn ghost" data-act="worst" data-f="${worstF}">Show the worst moment, ${esc(clockAt(fc.times[worstF]))}</button></div>
-    <div class="sec"><div class="sec-h">Forecast area</div>
-      <div class="sub">${esc(a.name)}${a.city && a.city !== "synthetic" ? ", " + esc(a.city) : ""}${a.synthetic ? " · sample streets" : ""}${a.corridor ? ` · main roads, ${a.cell_m} m grid` : ""}</div>
-      <div class="btns">${S.me && !S.meInside ? `<button class="btn primary" data-act="build-here">Forecast my area</button>` : ""}
-        ${["here", "trip"].includes(a.area_id) ? `<button class="btn ghost" data-act="reset-area">Back to the default area</button>` : ""}
-        ${per && S.fc.mode === "live" ? `<button class="btn ghost" data-act="edit-commute">Edit commute</button>` : ""}
-        <button class="btn ghost" data-act="how">How it works</button></div></div>`;
+      <div class="kv2"><div><b class="num">${fc.total_mm}</b><span>mm of rain</span></div><div><b class="num">${esc(short(fc.times[peakI]))}</b><span>heaviest rain</span></div><div><b class="num">${worstN}</b><span>streets over ${limit()} cm on screen</span></div></div>
+      ${worstN ? `<button class="btn ghost" data-act="worst" data-f="${worstF}">Show the worst moment, ${esc(clockAt(worstF * 10))}</button>` : ""}</div>
+    ${coverageCard()}
+    <div class="sec"><div class="btns">${!live ? "" : `<button class="btn ghost" data-act="demo-here">${ICON.storm}Demo storm here</button>`}
+        ${per && live ? `<button class="btn ghost" data-act="edit-commute">Edit commute</button>` : ""}
+        <button class="btn ghost" data-act="how">How it works</button></div>
+      <div class="hint">${S.cfg.synthetic ? "Synthetic streets (offline mode)." : "Streets © OpenStreetMap contributors · terrain: AWS Terrain Tiles."}</div></div>`;
 }
-
+function worstMoment() {
+  let worstF = 0, worstN = 0;
+  const tiles = visibleTiles().filter((t) => t.lod === "detail" && t.fc);
+  if (!tiles.length) return { worstF, worstN };
+  const n = tiles[0].fc.n, L = limit();
+  for (let f = 0; f < n; f++) {
+    let c = 0;
+    for (const tl of tiles) { const N = tl.fc.nseg, seg = tl.fc.seg; for (let i = 0; i < N; i++) if (seg[f * N + i] >= L) c++; }
+    if (c > worstN) { worstN = c; worstF = f; }
+  }
+  return { worstF, worstN };
+}
 function contextLines() {
-  const c = S.fc.context || {}, out = [];
-  if (S.fc.replay) out.push(`Replaying <b>${esc(S.fc.replay.name)}</b> (${esc(S.fc.replay.date)}): ${S.fc.replay.total_6h} mm in its wettest 6 hours, from recorded rain.`);
-  if (c.return_years) out.push(`Heaviest hour <b>${c.peak_hourly_mm} mm/h</b>: about a <b>1-in-${c.return_years >= 10 ? Math.round(c.return_years) : c.return_years}-year</b> downpour for this part of Chennai.`);
+  const c = S.sum.context || {}, out = [];
+  const rp = S.sum.replay;
+  if (rp && rp.name) out.push(`Replaying <b>${esc(rp.name)}</b> (${esc(rp.date || "")}): ${rp.total_6h} mm in its wettest 6 hours, from recorded rain.`);
+  if (S.sum.mode === "demo") out.push(`An <b>elevated storm</b> on your real streets: only the rain is scripted.`);
+  if (c.return_years) out.push(`Heaviest hour <b>${c.peak_hourly_mm} mm/h</b>: about a <b>1-in-${c.return_years >= 10 ? Math.round(c.return_years) : c.return_years}-year</b> downpour here.`);
   else if (c.peak_hourly_mm > 5) out.push(`Heaviest hour <b>${c.peak_hourly_mm} mm/h</b>.`);
   if (c.ground) out.push(`Ground is <b>${esc(c.ground.ground)}</b>: ${c.ground.rain_7d} mm in the last 7 days.`);
   if (c.tide?.next_high_min != null) out.push(`High tide at <b>${esc(clockAt(c.tide.next_high_min))}</b>: drains in low-lying streets empty more slowly.`);
@@ -865,14 +1091,14 @@ function commuteView() {
       <label class="field">Leave at <input type="time" id="leave-time" value="${esc(d.leave)}"></label>
       <div class="seg" role="radiogroup" aria-label="Travel mode">${MODES.map(([m, l]) => `<button data-dmode="${m}" class="${m === d.mode ? "on" : ""}">${l}</button>`).join("")}</div>
       <div class="btns"><button class="btn primary" data-act="save-commute" ${d.home && d.work ? "" : "disabled"}>Save commute</button>
-        ${S.me && S.meInside ? `<button class="btn ghost" data-act="me-home">Use my location as home</button>` : ""}</div>
+        ${S.me ? `<button class="btn ghost" data-act="me-home">Use my location as home</button>` : ""}</div>
       <div class="hint">Saved on this server only. Cedar lets nobody but you read it.</div></div>`;
 }
 function openCommuteEditor(patch) {
   const p = S.persona && S.persona.name === "You" ? S.persona : null;
   S.draft = S.draft || {
     work: p ? { lat: p.from[0], lon: p.from[1], label: p.from_label } : null,
-    home: p ? { lat: p.to[0], lon: p.to[1], label: p.to_label } : (S.me && S.meInside ? { lat: S.me.lat, lon: S.me.lon, label: "Home (here)" } : null),
+    home: p ? { lat: p.to[0], lon: p.to[1], label: p.to_label } : (S.me ? { lat: S.me.lat, lon: S.me.lon, label: "Home (here)" } : null),
     leave: p?.leave || "18:00", mode: p?.mode || S.mode,
   };
   Object.assign(S.draft, patch || {});
@@ -894,16 +1120,16 @@ function reportView() {
   const opts = [[0, "Dry road", "No water"], [10, "Ankle", "about 10 cm"], [25, "Shin", "about 25 cm"], [45, "Knee", "about 45 cm"], [90, "Waist", "about 90 cm"], [-1, "Road closed", "barricade or police"]];
   return `<div class="sec"><div class="place-title">How deep is the water?</div>
       <div class="sub">At ${esc(at.label)}. Reports are anonymous; they correct the forecast nearby for the next 2 hours and show on everyone's map.</div>
-      <div class="depths">${opts.map(([d, n, sub]) => `<button data-depth="${d}"><b>${n}</b><span>${sub}</span><i style="background:${d < 0 ? `repeating-linear-gradient(90deg, ${rgb(T.w[2])} 0 6px, transparent 6px 10px)` : d ? rgb(waterRGB(d)) : "var(--accent)"}"></i></button>`).join("")}</div></div>`;
+      <div class="depths">${opts.map(([d, n, sub]) => `<button data-depth="${d}"><b>${n}</b><span>${sub}</span><i style="background:${d < 0 ? `repeating-linear-gradient(90deg, ${rgb(T.w[2])} 0 6px, transparent 6px 10px)` : d ? rgb(waterRGB(d)) : "var(--text)"}"></i></button>`).join("")}</div></div>`;
 }
 function openReport() {
   let at;
   if (S.view === "place" && S.place) at = { lat: S.place.lat, lon: S.place.lon, label: S.place.name };
-  else if (S.me && S.meInside) at = { lat: S.me.lat, lon: S.me.lon, label: "your location" };
+  else if (S.me) at = { lat: S.me.lat, lon: S.me.lon, label: "your location" };
   else {
-    const [x, y] = toWorld(isDesk() ? (W + 424) / 2 : W / 2, isDesk() ? H / 2 : H / 3), i = hit(...toScreen(x, y), 60);
-    const [la, lo] = i >= 0 ? unproj(G.segs[i].mx, G.segs[i].my) : unproj(x, y);
-    at = { lat: la, lon: lo, label: i >= 0 ? G.segs[i].name : "the middle of the map" };
+    const [x, y] = toWorld(isDesk() ? (W + 424) / 2 : W / 2, isDesk() ? H / 2 : H / 3), gid = hit(...toScreen(x, y), 60), sg = gid && SEGS.get(gid);
+    const [la, lo] = sg ? unproj(sg.mx, sg.my) : unproj(x, y);
+    at = { lat: la, lon: lo, label: sg ? sg.name : "the middle of the map" };
   }
   S.reportAt = at;
   go("report", "half");
@@ -913,11 +1139,14 @@ async function sendReport(depth) {
   const r = await api("/api/report", { user: S.user, lat: at.lat, lon: at.lon, depth_cm: depth });
   if (!r.ok) { notice(`<div class="b">${r.status === 0 ? "You're offline. Try again when you're connected." : esc(r.j?.detail || "Couldn't send the report.")}</div><div class="btns"><button class="btn ghost" data-n="ok">OK</button></div>`); return; }
   back();
-  const sn = $("#snack");
   if (depth < 0) { await loadClosures(); if (S.view === "dir") refreshPlan(); }
-  sn.innerHTML = `<span>Thanks. Reported: ${esc(r.j.report.text)}.</span><button>OK</button>`; sn.hidden = false; delete sn.dataset.reload;
+  snack(`Thanks. Reported: ${esc(r.j.report.text)}.`);
+}
+function snack(html, ms = 6000) {
+  const sn = $("#snack");
+  sn.innerHTML = `<span>${html}</span><button>OK</button>`; sn.hidden = false; delete sn.dataset.reload;
   $("button", sn).onclick = () => (sn.hidden = true);
-  setTimeout(() => (sn.hidden = true), 6000);
+  clearTimeout(snack.t); snack.t = setTimeout(() => (sn.hidden = true), ms);
 }
 $("#report").onclick = () => { unlockAudio(); openReport(); };
 async function loadClosures() {
@@ -926,23 +1155,23 @@ async function loadClosures() {
 }
 async function loadReports() {
   const r = await api("/api/reports?hours=6");
-  if (r.ok) { S.reports = r.j.reports; S.reportsNow = r.j.now; }
+  if (r.ok) { S.reports = r.j.reports; }
 }
 function drawReports() {
-  if (!S.reports.length) return;
-  const z = V.k / V.fitK, now = Date.now() / 1000;
+  if (!S.reports.length || V.k < 0.1) return;
+  const now = Date.now() / 1000;
   for (const r of S.reports) {
+    if (r.kind === "closed") continue;
     const [sx, sy] = toScreen(...proj(r.lat, r.lon));
     if (sx < -20 || sy < -20 || sx > W + 20 || sy > H + 20) continue;
     const age = Math.max(0, (now - r.ts) / 60), fade = clamp(1 - age / 360, 0.35, 1);
-    if (r.kind === "closed") continue;  // shown as a closure on the street instead
-    const col = r.depth_cm_reported ? waterRGB(r.depth_cm_reported) : hexRGB(T.accent);
+    const col = r.depth_cm_reported ? waterRGB(r.depth_cm_reported) : hexRGB(T.text);
     ctx.globalAlpha = fade;
-    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(sx, sy, 8.5, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = rgb(col); ctx.beginPath(); ctx.arc(sx, sy, 6, 0, Math.PI * 2); ctx.fill();
-    if (z > 2.2) {
+    ctx.fillStyle = T.dark ? "#000" : "#fff"; ctx.fillRect(sx - 8, sy - 8, 16, 16);
+    ctx.fillStyle = rgb(col); ctx.fillRect(sx - 5.5, sy - 5.5, 11, 11);
+    if (V.k > 0.6) {
       const label = `${r.depth_cm_reported ? r.depth_cm_reported + " cm" : "dry"} · ${age < 60 ? Math.round(age) + " min" : Math.round(age / 60) + " h"} ago`;
-      ctx.font = "600 11.5px 'Instrument Sans', system-ui, sans-serif"; ctx.textAlign = "left";
+      ctx.font = `700 11.5px ${FONT}`; ctx.textAlign = "left";
       ctx.lineWidth = 3; ctx.strokeStyle = T.halo; ctx.strokeText(label, sx + 12, sy + 4);
       ctx.fillStyle = T.label; ctx.fillText(label, sx + 12, sy + 4);
     }
@@ -955,40 +1184,42 @@ function placeView() {
   const p = S.place;
   if (!p) return "";
   if (!p.timeline) return `<div class="sec"><div class="place-title">${esc(p.name)}</div>${SHIM}</div>`;
-  const d = Math.round(depthAt(p.seg, S.t)), st = statusOf(d), peak = Math.max(...p.timeline), pk = p.timeline.indexOf(peak);
-  const W2 = 320, H2 = 76, mx = Math.max(60, peak, limit() * 1.2);
-  const pts = p.timeline.map((v, f) => `${(f / (p.timeline.length - 1) * W2).toFixed(1)},${(H2 - v / mx * (H2 - 4)).toFixed(1)}`).join(" ");
+  const tl = p.timeline.length ? p.timeline : [0];
+  const d = SEGS.get(p.gid) ? Math.round(depthAt(p.gid, S.t)) : tl[clamp(Math.round(S.t / 10), 0, tl.length - 1)];
+  const st = statusOf(d), peak = Math.max(...tl), pk = tl.indexOf(peak);
+  const W2 = 320, H2 = 80, mx = Math.max(60, peak, limit() * 1.2);
+  const pts = tl.map((v, f) => `${(f / Math.max(1, tl.length - 1) * W2).toFixed(1)},${(H2 - v / mx * (H2 - 4)).toFixed(1)}`).join(" ");
   const ly = H2 - limit() / mx * (H2 - 4), nx = S.t / 360 * W2;
   return `<div class="sec">
       <div class="place-title">${esc(p.name)}</div>
-      <div class="sub">${esc(p.locality)} · ${esc(p.highway.replace("_", " "))} · ${p.length_m} m</div>
+      <div class="sub">${esc(p.locality)} · ${esc((p.highway || "").replace("_", " "))} · ${p.length_m} m${p.lod === "region" ? " · main-road forecast" : ""}</div>
       ${placeTags(p, d)}
       <div class="big"><b class="num" style="color:${d >= 6 ? rgb(waterRGB(d)) : "var(--text)"}">${d >= 6 ? d : 0}</b><span>cm at ${esc(clockAt(S.t))}</span><span class="pill ${st}">${st === "alert" ? `Too deep to ${S.mode === "walk" ? "walk" : "ride"}` : st === "watch" ? "Near the limit" : "Passable"}</span></div>
       <div class="curve"><svg viewBox="0 0 ${W2} ${H2}" preserveAspectRatio="none" aria-label="Depth over the next 6 hours, peaking at ${peak} cm">
-        <line x1="0" x2="${W2}" y1="${ly}" y2="${ly}" stroke="${rgb(T.w[2])}" stroke-dasharray="4 4" stroke-width="1" opacity=".7" vector-effect="non-scaling-stroke"/>
-        <polygon points="0,${H2} ${pts} ${W2},${H2}" fill="${rgb(T.w[0])}" opacity=".16"/>
-        <polyline points="${pts}" fill="none" stroke="${rgb(T.w[0])}" stroke-width="2" vector-effect="non-scaling-stroke"/>
-        <line x1="${nx}" x2="${nx}" y1="0" y2="${H2}" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>
+        <line x1="0" x2="${W2}" y1="${ly}" y2="${ly}" stroke="${rgb(T.w[2])}" stroke-dasharray="4 4" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+        <polygon points="0,${H2} ${pts} ${W2},${H2}" fill="${rgb(T.w[1])}" opacity=".14"/>
+        <polyline points="${pts}" fill="none" stroke="${rgb(T.w[1])}" stroke-width="2.5" vector-effect="non-scaling-stroke"/>
+        <line x1="${nx}" x2="${nx}" y1="0" y2="${H2}" stroke="currentColor" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>
         <div class="ax"><span>Now</span><span>Peak ${peak} cm at ${esc(clockAt(pk * 10))} · dashed: ${limit()} cm limit</span><span>+6 h</span></div></div>
-      <div class="btns"><button class="btn primary" data-act="dir-here">${ICON.dir}Directions</button><button class="btn ghost" data-act="report-here">Report water here</button><button class="btn ghost" data-act="peak" data-f="${pk}">Show peak</button></div>
+      <div class="btns"><button class="btn primary" data-act="dir-here">${ICON.dir}Directions</button><button class="btn ghost" data-act="report-here">Report water</button><button class="btn ghost" data-act="peak" data-f="${pk}">Show peak</button></div>
       <div class="btns"><button class="btn ghost" data-act="save-home">Set as home</button><button class="btn ghost" data-act="save-work">Set as work</button></div>
     </div>
     <div class="sec"><div class="sec-h">Past flood reports nearby<small>OpenSearch</small></div>
-      ${p.reports.length ? p.reports.map((r) => `<div class="rep"><span class="d">${esc(r.date)}${r.source === "synthetic-seed" ? '<span class="seed">seed data</span>' : r.source === "documented" ? '<span class="seed doc">documented</span>' : r.source === "resident" ? '<span class="seed">resident</span>' : ""}${r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">source</a>` : ""}</span>${esc(r.text)}</div>`).join("") : `<div class="empty">No reports within 400 m.</div>`}
+      ${p.reports.length ? p.reports.map((r) => `<div class="rep"><span class="d">${esc(r.date || "")}${r.source === "synthetic-seed" ? '<span class="seed">seed data</span>' : r.source === "documented" ? '<span class="seed doc">documented</span>' : r.source === "resident" ? '<span class="seed">resident</span>' : ""}${r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">source</a>` : ""}</span>${esc(r.text)}</div>`).join("") : `<div class="empty">No reports within 400 m.</div>`}
     </div>`;
 }
 async function openPlace(p) {
   closeFloating();
-  if (p.seg == null) return;
-  const sg = G.segs[p.seg], [la, lo] = unproj(sg.mx, sg.my);
-  S.place = { seg: p.seg, name: sg.name, lat: la, lon: lo };
-  qEl.value = sg.name; $("#q-clear").hidden = false;
+  if (!p.gid) return;
+  const sg = SEGS.get(p.gid);
+  if (sg) { const [la, lo] = unproj(sg.mx, sg.my); S.place = { gid: p.gid, name: sg.name, lat: la, lon: lo }; flyTo(sg.mx, sg.my, Math.max(V.k, 0.8)); }
+  else { S.place = { gid: p.gid, name: p.name || "Street", lat: p.lat, lon: p.lon }; if (p.lat) flyTo(...proj(p.lat, p.lon), Math.max(V.k, 0.8)); }
+  qEl.value = S.place.name; $("#q-clear").hidden = false;
   go("place", "half");
-  flyTo(sg.mx, sg.my, Math.max(V.k, V.fitK * 3));
-  const r = await api(`/api/segment/${p.seg}`);
-  if (r.ok && S.place?.seg === p.seg) { Object.assign(S.place, r.j); render(); }
+  const r = await api(`/api/segment/${p.gid}`);
+  if (r.ok && S.place?.gid === p.gid) { Object.assign(S.place, r.j); render(); }
+  else if (!r.ok && S.place?.gid === p.gid) { S.place.timeline = []; S.place.reports = []; render(); }
 }
-
 function placeTags(p, d) {
   const t = [];
   if (p.underpass) t.push(d >= 30 ? `<span class="tag bad">Subway · likely closed (city shuts subways around 30 cm)</span>` : `<span class="tag warn">Subway · floods first in heavy rain</span>`);
@@ -1001,19 +1232,19 @@ function placeTags(p, d) {
 /* directions */
 function viaOf(route) {
   const tally = new Map();
-  for (const [si] of route.profile) { const sg = G.segs[si]; if (sg.name.startsWith("Unnamed")) continue; tally.set(sg.name, (tally.get(sg.name) || 0) + sg.len); }
+  for (const [gid] of route.profile) { const sg = SEGS.get(gid); if (!sg || sg.name.startsWith("Unnamed")) continue; tally.set(sg.name, (tally.get(sg.name) || 0) + sg.len); }
   const top = [...tally].sort((a, b) => b[1] - a[1])[0];
   return top ? `via ${top[0]}` : "";
 }
 function strip(route, lim) {
-  const tot = route.profile.reduce((s, [si]) => s + G.segs[si].len, 0) || 1;
-  return `<span class="strip">${route.profile.map(([si, d]) => `<i style="width:${(G.segs[si].len / tot * 100).toFixed(2)}%;background:${d >= lim * 0.6 ? rgb(waterRGB(d)) : "var(--accent)"};opacity:${d >= lim * 0.6 ? 1 : 0.5}"></i>`).join("")}</span>`;
+  const lens = route.profile.map(([gid]) => SEGS.get(gid)?.len || 60), tot = lens.reduce((a, b) => a + b, 0) || 1;
+  return `<span class="strip">${route.profile.map(([, d], i) => `<i style="width:${(lens[i] / tot * 100).toFixed(2)}%;background:${d >= lim * 0.6 ? rgb(waterRGB(d)) : "var(--text)"};opacity:${d >= lim * 0.6 ? 1 : 0.35}"></i>`).join("")}</span>`;
 }
 function dirView() {
   const tr = S.trip;
   if (!tr) return "";
   const P = S.plan, adv = S.advice, fromMe = tr.from_label === "Your location";
-  let banner = `<div class="banner clear"><span class="bi">·</span>${SHIM}</div>`, opts = "", start = "";
+  let banner = S.planWait ? prepBox(S.planWait) : `<div class="banner clear"><span class="bi">·</span>${SHIM}</div>`, opts = "", start = "";
   if (P) {
     const st = P.status, w = P.usual.worst;
     const head = adv?.headline || (st === "alert" ? `${w.name}: ${w.depth} cm` : st === "watch" ? `Water building on ${w.name}` : "Your route is dry");
@@ -1033,7 +1264,7 @@ function dirView() {
     if (P.avoided?.length || P.subways_closed?.length) opts += `<div class="tags" style="margin-top:8px">${(P.avoided || []).map((a) => `<span class="tag warn">Avoids ${esc(a.name)} · ${esc(a.why)}</span>`).join("")}${(P.subways_closed || []).map((n) => `<span class="tag bad">${esc(n)} subway likely closed</span>`).join("")}</div>`;
     const link = sel === "dry" ? P.gmaps : (P.gmaps_usual || P.gmaps);
     start = `<div class="gobar"><a class="btn primary block" href="${esc(link)}" target="_blank" rel="noopener">${ICON.go}Start in Google Maps · ${(sel === "dry" ? P.dry : P.usual).minutes} min</a></div>`;
-    opts += `<div class="note" style="margin-top:6px">${sel === "dry" ? "Google Maps opens with stops that keep you on the dry route." : "Opens this route in Google Maps."}${S.area.corridor ? ` Checks main roads on a ${S.area.cell_m} m grid; local lanes at either end aren't covered.` : ""}</div>`;
+    opts += `<div class="note" style="margin-top:6px">${sel === "dry" ? "Google Maps opens with stops that keep you on the dry route." : "Opens this route in Google Maps."}${P.lod === "main roads" ? ` A ${P.corridor_km} km trip: main roads are checked along the way, every street near both ends.` : ""}</div>`;
   }
   return `<div class="sec">
       <div class="wps">
@@ -1047,7 +1278,7 @@ function dirView() {
       </div>
       ${banner}
     </div>
-    <div class="sec">${opts || SHIM}</div>${start}`;
+    <div class="sec">${opts || (S.planWait ? `<div class="hint">Streets along the way are loading in the background. This updates by itself.</div>` : SHIM)}</div>${start}`;
 }
 function openCommute() {
   if (!S.persona) return openCommuteEditor();
@@ -1059,8 +1290,7 @@ function openCommute() {
   refreshPlan(true);
 }
 function openDirectionsTo(to) {
-  const fromMe = S.me && S.meInside;
-  const from = fromMe ? { lat: S.me.lat, lon: S.me.lon, label: "Your location" }
+  const from = S.me ? { lat: S.me.lat, lon: S.me.lon, label: "Your location" }
     : S.view === "dir" && S.trip ? { lat: S.trip.from[0], lon: S.trip.from[1], label: S.trip.from_label }
     : S.persona ? { lat: S.persona.from[0], lon: S.persona.from[1], label: S.persona.from_label }
     : (() => { const [la, lo] = unproj(...toWorld(isDesk() ? (W + 424) / 2 : W / 2, H / 2)); return { lat: la, lon: lo, label: "Map centre" }; })();
@@ -1076,41 +1306,56 @@ function tripBody() {
   if (!t || t.kind === "commute") return {};
   return { from: t.from, to: t.to, from_label: t.from_label, to_label: t.to_label };
 }
-let planToken = 0;
+let planToken = 0, planRetry = null;
 async function refreshPlan(fit) {
   const tok = ++planToken;
-  S.plan = null; S.advice = null; routeCache.key = null; render();
+  clearTimeout(planRetry);
+  if (fit !== false && !S.planWait) { S.plan = null; S.advice = null; routeCache.key = null; render(); }  // keep the old plan on screen while refreshing
+  if (fit && S.trip) fitPoints([S.trip.from, S.trip.to].map(([a, b]) => proj(a, b)));
   const r = await api("/api/route", { user: "priya", mode: S.mode, depart_min: S.depart, ...tripBody() });
   if (tok !== planToken) return;
   if (r.status === 409) { S.view = "home"; openCommuteEditor(); return; }
-  if (!r.ok) { $("#sheet-body").innerHTML = `<div class="sec"><div class="empty">${r.status === 0 ? "You're offline, and this route isn't saved on this device." : "Couldn't plan that route."}</div></div>`; return; }
-  S.plan = r.j; S.adviceLoading = true; render();
-  if (fit) fitPoints([...S.plan.usual.coords, ...(S.plan.dry?.coords || [])].map(([a, b]) => proj(a, b)));
+  if (r.status === 202) { S.planWait = r.j.message; render(); planRetry = setTimeout(() => refreshPlan(false), 2500); return; }
+  S.planWait = null;
+  if (!r.ok) { $("#sheet-body").innerHTML = `<div class="sec"><div class="empty">${r.status === 0 ? "You're offline, and this route isn't saved on this device." : esc(r.j?.message || "Couldn't plan that route.")}</div></div>`; return; }
+  S.plan = r.j; routeCache.key = null; S.adviceLoading = !S.advice; render();
+  if (fit !== false) fitPoints([...S.plan.usual.coords, ...(S.plan.dry?.coords || [])].map(([a, b]) => proj(a, b)));
   const a = await api("/api/advise", { user: "priya", mode: S.mode, depart_min: S.depart, ...tripBody() });
   if (tok !== planToken) return;
-  S.adviceLoading = false; S.advice = a.ok ? a.j : null; render();
+  S.adviceLoading = false; S.advice = a.ok && a.status === 200 ? a.j : null; render();
 }
+let commuteRetry = null;
 async function refreshCommute() {
-  if (!S.persona) { S.commute = null; if (S.view === "home") render(); return; }
+  clearTimeout(commuteRetry);
+  if (!S.persona) { S.commute = null; S.commuteWait = null; if (S.view === "home") render(); return; }
   const r = await api("/api/route", { user: "priya", mode: S.mode, depart_min: S.persona.depart_min ?? 0 });
-  if (r.ok) S.commute = r.j;
+  if (r.status === 202) { S.commuteWait = r.j.message; commuteRetry = setTimeout(refreshCommute, 2500); }
+  else { S.commuteWait = null; if (r.ok) S.commute = r.j; }
   if (S.view === "home") render();
+}
+async function loadPersona() {
+  const c = await api(`/api/commute?user=priya`);
+  if (c.ok) { S.persona = c.j.persona; S.demo = c.j.demo || S.demo; }
+  S.personaLoaded = true;
+  if (S.persona && !prefs.mode && S.persona.mode) S.mode = S.persona.mode;
+  S.depart = S.persona?.depart_min ?? 0;
+  await refreshCommute();
 }
 
 /* ward desk / control room */
 function opsView() {
-  const O = S.ops, u = S.area.users[S.user];
+  const O = S.ops, u = S.cfg.users[S.user];
   if (!O) return `<div class="peek sec">${SHIM}</div>`;
   if (O.forbidden) return `<div class="peek sec"><div class="empty">No access to ward operations.</div></div>`;
   const total = O.localities.reduce((s, l) => s + l.impassable, 0), one = O.localities.length === 1 ? O.localities[0] : null;
-  const rows = one ? one.flooded.map((f) => ({ seg: f.seg_id, n: f.name, d: f.depth_cm, s: f.locality }))
-    : O.localities.map((l) => ({ seg: l.worst?.seg_id, n: l.locality, d: l.max_depth, s: `${l.impassable} streets over 30 cm${l.worst ? " · worst " + l.worst.name : ""}` }));
+  const rows = one ? one.flooded.map((f) => ({ gid: f.seg_id, n: f.name, d: f.depth_cm, s: f.locality }))
+    : O.localities.map((l) => ({ gid: l.worst?.seg_id, n: l.locality, d: l.max_depth, s: `${l.impassable} streets over 30 cm${l.worst ? " · worst " + l.worst.name : ""}` }));
   const vul = S.vuln?.sites || [];
   return `<div class="peek sec"><div class="commute">
-      <span class="ico">${ICON.locality}</span><span class="t">${S.user === "control" ? "Control room · all localities" : `Ward desk · ${esc(one?.locality || u.label)}`}</span>
+      <span class="ico">${ICON.locality}</span><span class="t">${S.user === "control" ? "Control room · all localities" : `Ward desk · ${esc(one?.locality || u.locality || u.label)}`}</span>
       <span class="d"><b class="num">${total}</b><span>over 30 cm</span></span><span class="s">at ${esc(O.clock)} · ${esc(O.decision.policies[0] || "allowed")}</span></div></div>
     <div class="sec"><div class="sec-h">${one ? "Streets to clear first" : "Localities by priority"}<small>OpenSearch aggregation</small></div>
-      <div class="list">${rows.slice(0, 8).map((x) => `<button class="li" ${x.seg != null ? `data-seg="${x.seg}"` : ""}><span class="n">${esc(x.n)}</span><span class="d num" style="color:${rgb(waterRGB(Math.max(1, x.d)))}">${x.d} cm</span><span class="s">${esc(x.s)}</span>${depthMeter(x.d)}</button>`).join("") || `<div class="empty">Nothing above 30 cm at this time.</div>`}</div>
+      <div class="list">${rows.slice(0, 8).map((x) => `<button class="li" ${x.gid ? `data-gid="${esc(x.gid)}"` : ""}><span class="n">${esc(x.n)}</span><span class="d num" style="color:${rgb(waterRGB(Math.max(1, x.d)))}">${x.d} cm</span><span class="s">${esc(x.s)}</span>${depthMeter(x.d)}</button>`).join("") || `<div class="empty">Nothing above 30 cm at this time.</div>`}</div>
       ${O.denied?.length ? `<div class="hint">${O.denied.length} other localities are hidden by Cedar policy.</div>` : ""}</div>
     ${S.user === "control" ? `<div class="sec"><div class="sec-h">Hospitals and schools with flooded access<small>within 200 m</small></div>
       <div class="list">${vul.map((p) => `<div class="li"><span class="n">${esc(p.name)}</span><span class="d num" style="color:${rgb(waterRGB(p.depth))}">${p.depth} cm</span><span class="s">${esc(p.kind)} · ${esc(p.street)}</span></div>`).join("") || `<div class="empty">None at this time.</div>`}</div></div>` : ""}`;
@@ -1119,6 +1364,7 @@ async function refreshOps() {
   const t = Math.round(S.t / 10) * 10;
   if (S.user !== "priya") { const r = await api(`/api/ops?user=${S.user}&t=${t}`); S.ops = r.ok ? r.j : { forbidden: true }; }
   if (S.user === "control") { const v = await api(`/api/vulnerable?user=control&t=${t}`); S.vuln = v.ok ? v.j : null; }
+  const w = await api("/api/world"); if (w.ok) S.cfg.users = w.j.users;
   if (S.view === "home") render();
 }
 
@@ -1126,9 +1372,9 @@ async function refreshOps() {
 let nearTimer = null;
 function scheduleNearby() { clearTimeout(nearTimer); nearTimer = setTimeout(refreshNearby, 250); }
 async function refreshNearby() {
-  if (S.user !== "priya" || !S.area) return;
+  if (S.user !== "priya" || !S.cfg) return;
   let lat, lon;
-  if (S.me && S.meInside) ({ lat, lon } = S.me);
+  if (S.me) ({ lat, lon } = S.me);
   else [lat, lon] = unproj(...toWorld(isDesk() ? (W + 424) / 2 : W / 2, isDesk() ? H / 2 : H / 3));
   const r = await api(`/api/nearby?lat=${lat}&lon=${lon}&t=${Math.round(S.t / 10) * 10}`);
   if (r.ok) { S.nearby = r.j; if (S.view === "home") render(); }
@@ -1137,8 +1383,8 @@ async function refreshNearby() {
 /* --------------------------------------------------------- wire actions */
 function wire(el) {
   $$("[data-act]", el).forEach((b) => b.addEventListener("click", () => act(b.dataset.act, b)));
-  $$("[data-seg]", el).forEach((b) => b.addEventListener("click", () => openPlace({ seg: +b.dataset.seg })));
-  $$("[data-mode]", el).forEach((b) => b.addEventListener("click", () => { S.mode = b.dataset.mode; prefs.mode = S.mode; savePrefs(); rasterKey = null; refreshPlan(); refreshCommute(); }));
+  $$("[data-gid]", el).forEach((b) => b.addEventListener("click", () => openPlace({ gid: b.dataset.gid })));
+  $$("[data-mode]", el).forEach((b) => b.addEventListener("click", () => { S.mode = b.dataset.mode; prefs.mode = S.mode; savePrefs(); for (const tl of TILES.values()) { tl.rasKey = null; tl.wetKey = null; } refreshPlan(); refreshCommute(); }));
   $$("[data-sel]", el).forEach((b) => b.addEventListener("click", () => { S.sel = b.dataset.sel; routeCache.key = null; render(); }));
   $$("[data-depth]", el).forEach((b) => b.addEventListener("click", () => sendReport(+b.dataset.depth)));
   $$("[data-dmode]", el).forEach((b) => b.addEventListener("click", () => { S.draft.mode = b.dataset.dmode; render(); }));
@@ -1169,20 +1415,26 @@ function act(a, b) {
     qEl.value = S.trip.to_label;
     refreshPlan(true);
   }
-  if (a === "build-here") buildArea("/api/locate", { lat: S.me.lat, lon: S.me.lon }, "Building the forecast for your area");
-  if (a === "reset-area") buildArea("/api/locate/reset", {}, "Going back to the default area");
+  if (a === "demo-here") setRain("demo");
   if (a === "tick" || a === "reset") systemAct(a, b);
+}
+async function setRain(source) {
+  const [lat, lon] = S.me ? [S.me.lat, S.me.lon] : unproj(V.cx, V.cy);
+  snack(source === "demo" ? "Starting the demo storm on the streets around you…" : "Switching rain source…", 4000);
+  const r = await api("/api/rain", { source, lat, lon });
+  if (!r.ok) notice(`<div class="h">Couldn't switch</div><div class="b">${esc(r.j?.error || "Try again in a moment.")}</div><div class="btns"><button class="btn ghost" data-n="ok">OK</button></div>`);
 }
 
 /* --------------------------------------------------------------- search */
 const qEl = $("#q"), sugg = $("#sugg");
 let suggItems = [], farItems = [], suggOn = -1, qTimer = null, gTimer = null;
+function searchNear() { return S.me ? [S.me.lat, S.me.lon] : unproj(V.cx, V.cy); }
 function showSuggestions() {
   const q = qEl.value.trim();
   clearTimeout(qTimer); clearTimeout(gTimer);
   if (q.length < 2) {
     const quick = [];
-    if (S.me && S.meInside && S.searchFor !== "dest") quick.push({ name: "Your location", kind: "me", lat: S.me.lat, lon: S.me.lon });
+    if (S.me && S.searchFor !== "dest") quick.push({ name: "Your location", kind: "me", lat: S.me.lat, lon: S.me.lon });
     if (S.persona && S.searchFor === "dest") {
       quick.push({ name: "Home", sub: S.persona.to_label, kind: "home", lat: S.persona.to[0], lon: S.persona.to[1] });
       quick.push({ name: "Work", sub: S.persona.from_label, kind: "work", lat: S.persona.from[0], lon: S.persona.from[1] });
@@ -1191,23 +1443,31 @@ function showSuggestions() {
     renderSugg(false);
     return;
   }
-  qTimer = setTimeout(async () => { const r = await api(`/api/search?q=${encodeURIComponent(q)}`); suggItems = r.j?.results || []; suggOn = -1; renderSugg(true); }, 130);
-  if (q.length >= 3) gTimer = setTimeout(async () => { const r = await api(`/api/geocode?q=${encodeURIComponent(q)}`); farItems = (r.j?.results || []).filter((p) => !insideArea(p.lat, p.lon) || !suggItems.length); renderSugg(true); }, 450);
+  const [lat, lon] = searchNear();
+  qTimer = setTimeout(async () => { const r = await api(`/api/search?q=${encodeURIComponent(q)}&lat=${lat}&lon=${lon}`); suggItems = r.j?.results || []; suggOn = -1; renderSugg(true); }, 130);
+  if (q.length >= 3) gTimer = setTimeout(async () => {
+    const r = await api(`/api/geocode?q=${encodeURIComponent(q)}&lat=${lat}&lon=${lon}`);
+    const have = new Set(suggItems.map((p) => p.name.toLowerCase()));
+    farItems = (r.j?.results || []).filter((p) => !have.has(p.name.toLowerCase())); renderSugg(true);
+  }, 450);
   else farItems = [];
 }
 function renderSugg(searched) {
   const all = [...suggItems, ...farItems];
   if (!all.length && !searched) { sugg.hidden = true; return; }
+  const [la, lo] = searchNear();
   const item = (p, i) => {
-    const d = p.seg != null && S.fc ? Math.round(depthAt(p.seg, S.t)) : null;
+    const d = p.seg && SEGS.get(p.seg) ? Math.round(depthAt(p.seg, S.t)) : null;
     const ic = p.recent ? ICON.clock : ICON[p.kind] || ICON.pin;
+    const km = p.lat != null && p.kind !== "me" ? haversine(la, lo, p.lat, p.lon) / 1000 : null;
+    const sub = [p.sub || (p.kind === "me" ? "GPS" : p.kind), km != null && km >= 1 ? `${km < 10 ? km.toFixed(1) : Math.round(km)} km` : ""].filter(Boolean).join(" · ");
     return `<button class="sg ${i === suggOn ? "on" : ""}" data-i="${i}" role="option"><span class="ic">${ic}</span><span class="n">${esc(p.name)}</span>
       <span class="d num" style="color:${d != null && d >= 6 ? rgb(waterRGB(d)) : "var(--faint)"}">${d != null ? (d >= 6 ? d + " cm" : "dry") : ""}</span>
-      <span class="s">${esc(p.sub || (p.kind === "me" ? "GPS" : p.kind) || "")}</span></button>`;
+      <span class="s">${esc(sub)}</span></button>`;
   };
   let html = "";
-  if (suggItems.length) html += (searched ? `<div class="hd">In ${esc(S.area.name)}</div>` : "") + suggItems.map(item).join("");
-  if (farItems.length) html += `<div class="hd">Elsewhere in India</div>` + farItems.map((p, i) => item(p, suggItems.length + i)).join("");
+  if (suggItems.length) html += (searched ? `<div class="hd">Streets and places nearby</div>` : "") + suggItems.map(item).join("");
+  if (farItems.length) html += `<div class="hd">Anywhere in India</div>` + farItems.map((p, i) => item(p, suggItems.length + i)).join("");
   if (!html) html = `<div class="hd">No matches yet</div>`;
   sugg.innerHTML = html; sugg.hidden = false;
   $$("[data-i]", sugg).forEach((b) => b.addEventListener("mousedown", (e) => { e.preventDefault(); pick(all[+b.dataset.i]); }));
@@ -1227,7 +1487,6 @@ qEl.addEventListener("blur", () => setTimeout(() => {
   if (!isDesk() && SH.snap === "peek") setSnap("half");
 }, 160));
 $("#q-clear").onclick = () => { qEl.value = ""; $("#q-clear").hidden = true; if (S.view !== "home") back(); else { qEl.focus(); showSuggestions(); } };
-function insideArea(lat, lon) { const [s, w, n, e] = S.area.bbox; return lat >= s && lat <= n && lon >= w && lon <= e; }
 function pick(p) {
   sugg.hidden = true; qEl.blur();
   if (!p) return;
@@ -1236,68 +1495,22 @@ function pick(p) {
     savePrefs();
   }
   if ((S.searchFor === "home" || S.searchFor === "work") && S.draft) {
-    if (!insideArea(p.lat, p.lon)) { notice(`<div class="b">${esc(p.name)} is outside ${esc(S.area.name)}. Your commute needs to be inside the forecast area.</div><div class="btns"><button class="btn ghost" data-n="ok">OK</button></div>`); return; }
     S.draft[S.searchFor] = { lat: p.lat, lon: p.lon, label: p.kind === "me" ? "Your location" : p.name };
     S.searchFor = "dest"; qEl.value = ""; render(); return;
   }
   if (S.searchFor === "from" && S.trip) {
     S.searchFor = "dest";
-    if (!insideArea(p.lat, p.lon)) return offerTrip(p, true);
     S.trip = { ...S.trip, kind: "custom", from: [p.lat, p.lon], from_label: p.kind === "me" ? "Your location" : p.name };
     qEl.value = S.trip.to_label;
     return refreshPlan(true);
   }
-  if (!insideArea(p.lat, p.lon)) return offerTrip(p);
-  if (p.seg != null && p.kind === "street") return openPlace({ seg: p.seg });
+  if (p.seg && p.kind === "street") return openPlace({ gid: p.seg, name: p.name, lat: p.lat, lon: p.lon });
   openDirectionsTo(p);
-}
-
-/* long trips: build a corridor forecast */
-function offerTrip(p, asStart) {
-  const from = asStart ? { lat: p.lat, lon: p.lon, label: p.name }
-    : S.me ? { lat: S.me.lat, lon: S.me.lon, label: "Your location" }
-    : S.persona ? { lat: S.persona.from[0], lon: S.persona.from[1], label: S.persona.from_label }
-    : (() => { const [la, lo] = unproj(V.cx, V.cy); return { lat: la, lon: lo, label: "Map centre" }; })();
-  const to = asStart ? { lat: S.trip.to[0], lon: S.trip.to[1], label: S.trip.to_label } : { lat: p.lat, lon: p.lon, label: p.name };
-  const km = Math.round(haversine(from.lat, from.lon, to.lat, to.lon) / 1000);
-  notice(`<div class="h">${esc(to.label)} is outside ${esc(S.area.name)}</div>
-    <div class="b">About ${km} km in a straight line. Build a forecast for the whole corridor? It covers the main roads between ${esc(from.label === "Your location" ? "you" : from.label)} and ${esc(to.label)} and takes a minute or two.</div>
-    <div class="btns"><button class="btn primary" data-n="go">Build trip forecast</button><button class="btn ghost" data-n="no">Cancel</button></div>`,
-  { go: () => buildArea("/api/trip", { from: [from.lat, from.lon], to: [to.lat, to.lon], from_label: from.label, to_label: to.label }, `Building the forecast to ${to.label}`) });
-}
-function haversine(a, b, c, d) {
-  const R = 6371000, p1 = a * Math.PI / 180, p2 = c * Math.PI / 180, dp = p2 - p1, dl = (d - b) * Math.PI / 180;
-  return 2 * R * Math.asin(Math.sqrt(Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2));
 }
 function notice(html, handlers = {}) {
   const n = $("#notice");
   n.innerHTML = html; n.hidden = false;
   $$("[data-n]", n).forEach((b) => b.addEventListener("click", () => { n.hidden = true; handlers[b.dataset.n]?.(); }));
-}
-async function buildArea(path, body, title) {
-  const r = await api(path, body);
-  if (r.j?.inside) { flyTo(...proj(S.me.lat, S.me.lon)); return; }
-  if (r.j?.error) { notice(`<div class="b">${esc(r.j.error)}</div><div class="btns"><button class="btn ghost" data-n="ok">OK</button></div>`); return; }
-  if (!r.ok) { notice(`<div class="b">${r.status === 0 ? "You're offline. Building a forecast needs a connection." : "Couldn't start that."}</div><div class="btns"><button class="btn ghost" data-n="ok">OK</button></div>`); return; }
-  const ov = document.createElement("div");
-  ov.id = "boot";
-  ov.innerHTML = `<div class="boot-mark"><span class="drop"></span>${esc(title)}</div><ol id="boot-log"></ol>`;
-  document.body.appendChild(ov);
-  const startArea = S.area.area_id, reset = path === "/api/locate/reset";
-  let sawBusy = false;
-  for (;;) {
-    await new Promise((res) => setTimeout(res, 1200));
-    const st = await api("/api/boot");
-    if (!st.j) continue;
-    $("#boot-log", ov).innerHTML = st.j.log.map((l) => `<li>${esc(l)}</li>`).join("");
-    if (st.j.building || !st.j.ready) { sawBusy = true; continue; }
-    if (!sawBusy && !reset) continue;
-    if (st.j.area_id !== startArea || reset) { location.href = "/"; return; }
-    $(".boot-mark", ov).innerHTML = '<span class="drop"></span>That didn\'t work';
-    const btn = document.createElement("button"); btn.className = "btn"; btn.textContent = "Back to the map"; btn.style.justifySelf = "start";
-    btn.onclick = () => ov.remove(); ov.appendChild(btn);
-    return;
-  }
 }
 
 /* ------------------------------------------------------------- location */
@@ -1307,12 +1520,13 @@ function initLocation(userAsked) {
   if (!("geolocation" in navigator)) { if (userAsked) notice(`<div class="b">Location isn't available in this browser.</div><div class="btns"><button class="btn ghost" data-n="ok">OK</button></div>`); return; }
   const ok = (pos) => {
     const { latitude: lat, longitude: lon, accuracy: acc } = pos.coords;
-    S.me = { lat, lon, acc }; S.meInside = insideArea(lat, lon);
+    S.me = { lat, lon, acc };
     $("#locate").classList.add("on");
+    if (haversine(lat, lon, G.lat0, G.lon0) > 60000) setOrigin(lat, lon);
     if (firstFix || userAsked) {
       firstFix = false;
-      if (S.meInside) { if (S.view === "home" || userAsked) flyTo(...proj(lat, lon)); scheduleNearby(); }
-      else offerBuild(userAsked);
+      centreOn(...proj(lat, lon), Math.max(V.k, 0.35));
+      sendFocus(true); scheduleNearby(); loadSummary(); maybeReanchorDemo();
       if (S.view === "home") render();
     }
   };
@@ -1322,31 +1536,26 @@ function initLocation(userAsked) {
   };
   navigator.geolocation.getCurrentPosition(ok, bad, { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 });
   if (geoWatch == null) geoWatch = navigator.geolocation.watchPosition((p) => {
-    S.me = { lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy }; S.meInside = insideArea(S.me.lat, S.me.lon);
+    S.me = { lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy };
   }, () => {}, { enableHighAccuracy: true, maximumAge: 30000 });
 }
-$("#locate").onclick = () => { unlockAudio(); if (!SECURE) return needsHttps("Your location"); if (S.me && S.meInside) flyTo(...proj(S.me.lat, S.me.lon)); else initLocation(true); };
-function offerBuild(userAsked) {
-  let skip = false;
-  try { skip = localStorage.getItem("pk-skip-build") === "1"; } catch { /* blocked */ }
-  if (skip && !userAsked) return;
-  notice(`<div class="h">You're outside ${esc(S.area.name)}</div>
-    <div class="b">Build the forecast for the streets around you? It downloads your area's streets and terrain and runs the flood model, which takes about a minute.</div>
-    <div class="btns"><button class="btn primary" data-n="go">Forecast my area</button><button class="btn ghost" data-n="no">Not now</button></div>`,
-  { go: () => buildArea("/api/locate", { lat: S.me.lat, lon: S.me.lon }, "Building the forecast for your area"),
-    no: () => { try { localStorage.setItem("pk-skip-build", "1"); } catch { /* blocked */ } } });
+function maybeReanchorDemo() {
+  // The demo storm is centred where the map was when it started. If you're somewhere else, move it to you.
+  const a = S.cfg?.run?.anchor;
+  if (S.sum?.mode !== "demo" || !a || !S.me || maybeReanchorDemo.done) return;
+  if (haversine(a[0], a[1], S.me.lat, S.me.lon) > 8000) { maybeReanchorDemo.done = true; setRain("demo"); }
 }
+$("#locate").onclick = () => { unlockAudio(); if (!SECURE) return needsHttps("Your location"); if (S.me) centreOn(...proj(S.me.lat, S.me.lon), Math.max(V.k, 0.6)); else initLocation(true); };
 
 /* ----------------------------------------------------------- user + menu */
-const USER_COLOR = { priya: "#6d4fd6", ravi: "#0c8577", control: "#c2410c" };
+const USER_COLOR = { priya: "#0a0a0a", ravi: "#0e7a5a", control: "#ff2d1a" };
 function setUser(u, quiet) {
   S.user = u;
   const av = $("#avatar");
-  av.textContent = S.area.users[u].label[0];
+  av.textContent = S.cfg.users[u].label[0];
   av.className = `avatar ${u}`;
   S.ops = null; S.vuln = null;
-  if (u === "control") prefs.layers.sites = true;
-  if (u !== "control") prefs.layers.sites = false;
+  prefs.layers.sites = u === "control";
   syncChips();
   if (quiet) return;
   S.view = "home"; stack.length = 0; S.plan = null;
@@ -1358,7 +1567,7 @@ let deferredInstall = null;
 addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); deferredInstall = e; });
 function renderMenu() {
   const m = $("#menu"), notif = "Notification" in window ? Notification.permission : "unsupported";
-  m.innerHTML = Object.entries(S.area.users).map(([id, u]) => `<button class="who" data-user="${id}" role="menuitem"><span class="av" style="background:${USER_COLOR[id]}">${esc(u.label[0])}</span><span>${esc(u.label)}</span><span class="ck">${id === S.user ? "✓" : ""}</span><small>${esc(u.desc || u.role)}</small></button>`).join("")
+  m.innerHTML = Object.entries(S.cfg.users).map(([id, u]) => `<button class="who" data-user="${id}" role="menuitem"><span class="av" style="background:${USER_COLOR[id]};color:${id === "priya" && T.dark ? "#000" : "#fff"};${id === "priya" && T.dark ? "background:#f5f5f2" : ""}">${esc(u.label[0])}</span><span>${esc(u.label)}</span><span class="ck">${id === S.user ? "✓" : ""}</span><small>${esc(u.desc || u.role)}</small></button>`).join("")
     + `<hr><div class="row"><span>Theme</span><span class="seg">${["auto", "light", "dark"].map((t) => `<button data-theme="${t}" class="${prefs.theme === t ? "on" : ""}">${t[0].toUpperCase() + t.slice(1)}</button>`).join("")}</span></div>
     <button class="row" data-m="notify"><span>Flood alerts on this device</span><span>${notif === "granted" ? "On" : notif === "denied" ? "Blocked in browser" : notif === "unsupported" ? "Not supported" : "Turn on"}</span></button>
     ${deferredInstall ? `<button class="row" data-m="install"><span>Install app</span><span>Opens offline</span></button>` : ""}
@@ -1405,11 +1614,12 @@ const pre = (o) => `<pre>${esc(JSON.stringify(o, null, 2))}</pre>`;
 function renderDrawer() {
   if (!S.drawer) return;
   $$("#tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === S.tab));
-  const body = $("#tab-body");
+  const body = $("#tab-body"), sc = body.scrollTop;
   body.innerHTML = S.tab === "why" ? whyTab() : S.tab === "ops" ? opsTab() : systemTab();
+  body.scrollTop = sc;
   $$("[data-rain]", body).forEach((b) => b.addEventListener("click", async () => {
-    $$("[data-rain]", body).forEach((x) => (x.disabled = true)); b.textContent = "Switching…";
-    await api("/api/rain", { source: b.dataset.rain });
+    $$("[data-rain]", body).forEach((x) => (x.disabled = true)); b.querySelector("i") ? (b.querySelector("i").textContent = "Starting…") : (b.textContent = "Switching…");
+    await setRain(b.dataset.rain);
   }));
   $$("[data-act]", body).forEach((b) => b.addEventListener("click", () => act(b.dataset.act, b)));
 }
@@ -1430,41 +1640,41 @@ function opsTab() {
   const O = S.ops;
   if (!O || O.forbidden) return `<div class="empty">Loading…</div>`;
   return `<div class="blk"><h5>Localities at ${esc(O.clock)} <small>OpenSearch aggregation</small></h5>
-    <div class="list">${O.localities.map((l) => `<div class="li"><span class="n">${esc(l.locality)}</span><span class="d num">${l.impassable} · ${l.max_depth} cm</span><span class="s">${l.worst ? "Worst: " + esc(l.worst.name) : "No flooding"} · drains ${l.drain_mmph} mm/h</span></div>`).join("")}</div>
+    <div class="list">${O.localities.map((l) => `<div class="li"><span class="n">${esc(l.locality)}</span><span class="d num">${l.impassable} · ${l.max_depth} cm</span><span class="s">${l.worst ? "Worst: " + esc(l.worst.name) : "No flooding"}</span></div>`).join("")}</div>
     <span class="cedar">${esc(O.decision.policies.join(", "))}</span>
     ${O.denied?.length ? `<div class="hint">Hidden by Cedar: ${O.denied.map(esc).join(", ")}</div>` : ""}</div>`;
 }
 function systemTab() {
   const s = S.status;
-  if (!s || !s.ready) return `<div class="empty">Loading status…</div>`;
-  const r = s.run;
-  return `<div class="blk"><h5>Rain data <small>${r.rain_source === "live" ? "live" : "demo"}</small></h5>
-      <span class="seg"><button data-rain="live" class="${r.rain_source === "live" ? "on" : ""}">Live (Open-Meteo)</button><button data-rain="demo" class="${r.rain_source === "demo" ? "on" : ""}">Demo storm</button></span>
-      <div class="hint">Replay a real Chennai storm (recorded hourly rain, ERA5):</div>
-      <div class="replays">${Object.entries(r.replays || {}).map(([k, n]) => `<button data-rain="replay:${k}" class="${r.rain_source === "replay:" + k ? "on" : ""}">${esc(n)}</button>`).join("")}</div>
-      <dl class="kv"><dt>Source</dt><dd>${esc(r.label)}</dd>${r.rain_source === "live" ? `<dt>Grid</dt><dd>${r.points} forecast points over the area · refreshes every ${r.refresh_min} min</dd>` : ""}
-      ${r.live_error ? `<dt>Last error</dt><dd style="color:var(--w1)">${esc(r.live_error)}</dd>` : ""}<dt>Reports</dt><dd>${r.resident_reports} from residents · ${r.observations} correcting the forecast now</dd></dl>
-      <div class="hint">Live uses the real forecast; if it isn't raining, nothing floods. Demo storm replays a scripted storm for presentations.</div></div>
-    <div class="blk"><h5>Chennai context <small>calibration</small></h5>
-      <dl class="kv">
-        <dt>Drains</dt><dd>${r.context?.climate ? `${r.context.drain_mmph} mm/h, sized for a 2-year storm from ${r.context.climate.years} years of ERA5 rain (2-yr hourly ${r.context.climate.hourly.T2} mm/h, 100-yr ${r.context.climate.hourly.T100} mm/h)` : `${r.context?.drain_mmph ?? 18} mm/h default (climate record unavailable)`}</dd>
-        <dt>Ground</dt><dd>${r.context?.ground ? `${esc(r.context.ground.ground)} · ${r.context.ground.rain_7d} mm in 7 days → runoff ${Math.round(r.context.ground.runoff * 100)}%, drains at ${Math.round(r.context.ground.drain_eff * 100)}%` : "unknown"}</dd>
-        <dt>Tide</dt><dd>${r.context?.tide ? `high tide in ${r.context.tide.next_high_min} min (${r.context.tide.next_high_m} m); low-lying drains slow down near it` : r.rain_source === "live" ? "unavailable" : "not used in demo or replay"}</dd>
-        <dt>Closures</dt><dd>${r.tomtom?.enabled ? (r.tomtom.error ? `TomTom error: ${esc(r.tomtom.error)}` : `TomTom live: ${r.tomtom.closed_segments} street segments closed`) : "TomTom off (set TOMTOM_API_KEY)"}; OpenStreetMap construction and barriers; resident reports</dd>
-        <dt>History</dt><dd>${r.documented} documented past closures matched to streets here</dd>
-      </dl></div>
-    <div class="blk"><h5>Forecast</h5><dl class="kv"><dt>Run</dt><dd class="num">${esc(s.run.id)}</dd><dt>Rain</dt><dd>${esc(s.run.label)} · ${s.run.total_mm} mm</dd><dt>Area</dt><dd>${esc(s.area.name)} · ${s.area.segments} street segments${s.area.synthetic ? " (sample)" : ""}</dd></dl>
-      <div class="btns"><button class="btn primary" data-act="tick">${s.run.rain_source === "live" ? "Refresh forecast now" : "Run nowcast update"}</button>${s.run.rain_source === "demo" ? `<button class="btn ghost" data-act="reset">Reset to ${esc(clockAt(0))}</button>` : ""}</div>
-      <div class="hint">For the demo, run <b>sam local invoke PollerFunction</b> instead (Lambda → SNS → SQS). This button delivers in-process.</div></div>
+  if (!s) return `<div class="empty">Loading status…</div>`;
+  const r = s.run, w = s.world, kind = r.kind, P = w.progress;
+  const modeBtn = (src, title, sub) => `<button data-rain="${src}" class="${(src === "demo" ? kind === "demo" : src === r.source) ? "on" : ""}"><b>${title}</b><span>${sub}</span><i>${(src === "demo" ? kind === "demo" : src === r.source) ? "On" : ""}</i></button>`;
+  const tilesGrid = (p) => `<div class="tiles-grid">${Array.from({ length: p.tiles }, (_, i) => `<i class="${i < p.forecast ? "fc" : i < p.ready ? "ready" : i < p.ready + p.empty ? "empty" : i < p.ready + p.empty + p.failed ? "failed" : ""}"></i>`).join("")}</div>`;
+  return `<div class="blk"><h5>Rain <small>${esc(kind)}</small></h5>
+      <div class="mode-card">${modeBtn("live", "Live", "Open-Meteo 15-minute forecast, refreshed every 15 min")}${modeBtn("demo", "Demo storm here", "An elevated storm on your real streets, centred on you. Only the rain is scripted.")}</div>
+      <div class="hint">Replay a real Chennai storm (recorded hourly rain, ERA5) on today's streets:</div>
+      <div class="replays">${Object.entries(r.replays || {}).map(([k, n]) => `<button data-rain="replay:${k}" class="${r.source === "replay:" + k ? "on" : ""}">${esc(n)}</button>`).join("")}</div>
+      <dl class="kv"><dt>Now</dt><dd>${esc(r.label)}</dd><dt>Rain grid</dt><dd>${r.rain.points} Open-Meteo points on a ${r.rain.lattice_deg}° lattice${r.rain.error ? ` · <span style="color:var(--w2)">${esc(r.rain.error)}</span>` : ""}</dd>
+      <dt>Reports</dt><dd>${r.resident_reports} from residents · ${r.documented} documented past closures matched</dd>
+      <dt>Closures</dt><dd>${r.tomtom.enabled ? (r.tomtom.error ? `TomTom error: ${esc(r.tomtom.error)}` : `TomTom live: ${r.tomtom.closed_segments} segments closed`) : "TomTom off (set TOMTOM_API_KEY)"}; OSM construction and barriers; resident reports</dd></dl>
+      <div class="btns"><button class="btn primary" data-act="tick">${kind === "live" ? "Refresh forecast now" : "Run nowcast update"}</button>${kind === "demo" ? `<button class="btn ghost" data-act="reset">Reset to ${esc(clockAt(0))}</button>` : ""}</div>
+      <div class="hint">For the demo video, run <b>sam local invoke PollerFunction</b> instead (Lambda → SNS → SQS). This button delivers in-process.</div></div>
+    <div class="blk"><h5>Map data <small>${w.synthetic ? "synthetic" : "OpenStreetMap + AWS terrain"}</small></h5>
+      <dl class="kv"><dt>Every street</dt><dd>${P.detail.ready + P.detail.empty}/${P.detail.tiles} tiles within ${P.detail.km} km · ${P.detail.forecast} forecast</dd>
+      <dt>Main roads</dt><dd>${P.region.ready + P.region.empty}/${P.region.tiles} tiles within ${P.region.km} km · ${P.region.forecast} forecast</dd>
+      <dt>Loaded</dt><dd>${w.tiles_loaded} tiles · ${w.segments.toLocaleString()} street segments</dd>
+      <dt>Jobs</dt><dd>${w.jobs.running} running · ${w.jobs.queued} queued · ${w.jobs.done} done${w.jobs.failed ? ` · ${w.jobs.failed} retrying` : ""}</dd></dl>
+      ${tilesGrid(P.detail)}${tilesGrid(P.region)}
+      <div class="log">${w.upstreams.map((u) => `<div class="lr ${u.state === "open" ? "bad" : ""}"><span class="t">${esc(u.state)}</span><span class="w">${esc(u.name)}</span><span class="m">${u.calls} calls · ${u.mb} MB${u.errors ? ` · ${u.errors} err` : ""}</span></div>`).join("")}</div></div>
     <div class="blk"><h5>OpenSearch <small>${s.store.engine === "opensearch" ? "connected" : "offline · in-memory"}</small></h5>
-      ${s.store.warning ? `<div class="hint" style="color:var(--w1)">${esc(s.store.warning)}</div>` : ""}
+      ${s.store.warning ? `<div class="hint">${esc(s.store.warning)}</div>` : ""}
       <div class="log">${s.queries.map((q) => `<details><summary class="lr"><span class="t">${esc(q.at)}</span><span class="w">${esc(q.op)}</span><span class="m">${q.ms} ms · ${q.hits}</span></summary>${pre(q.query)}</details>`).join("")}</div></div>
     <div class="blk"><h5>Cedar <small>${s.policy.policies.length} policies</small></h5>
       <div class="log">${s.decisions.map((d) => `<details><summary class="lr ${d.allowed ? "" : "deny"}"><span class="t">${esc(d.at)}</span><span class="w">${esc(d.principal.split("::")[1].replace(/"/g, ""))} → ${esc(d.action.split("::")[1].replace(/"/g, ""))}</span><span class="m">${d.allowed ? "allow" : "deny"}</span></summary>${pre(d)}</details>`).join("")}</div></div>
     <div class="blk"><h5>Alerts <small>${s.alerts.localstack ? "LocalStack SNS → SQS" : "LocalStack offline"}</small></h5>
       <div class="log">${s.pipeline.map((p) => `<div class="lr"><span class="t">${esc(p.at)}</span><span class="w">${esc(p.step)}</span><span class="m">${esc(p.detail).slice(0, 36)}</span></div>`).join("") || `<div class="empty">No alert activity yet.</div>`}</div></div>
     <div class="blk"><h5>Agent <small>Strands</small></h5><dl class="kv"><dt>Provider</dt><dd>${esc(s.agent.provider)} · ${esc(s.agent.model)}</dd><dt>Status</dt><dd>${s.agent.ready ? "ready" : esc(s.agent.note)}</dd></dl></div>
-    <div class="blk"><h5>This device</h5><dl class="kv"><dt>Offline cache</dt><dd>${"serviceWorker" in navigator ? (navigator.serviceWorker.controller ? "active" : "starting") : "not supported"}</dd><dt>Alerts</dt><dd>${"Notification" in window ? Notification.permission : "not supported"}</dd></dl></div>`;
+    <div class="blk"><h5>This device</h5><dl class="kv"><dt>Offline cache</dt><dd>${"serviceWorker" in navigator && SECURE ? (navigator.serviceWorker.controller ? "active" : "starting") : "needs HTTPS"}</dd><dt>Tiles in memory</dt><dd>${[...TILES.values()].filter((t) => t.status === "ready").length}</dd><dt>Alerts</dt><dd>${"Notification" in window ? Notification.permission : "not supported"}</dd></dl></div>`;
 }
 async function systemAct(a, b) {
   b.disabled = true; b.textContent = a === "tick" ? "Updating…" : "Resetting…";
@@ -1480,31 +1690,44 @@ let statusTimer = null;
 async function pollStatus() {
   clearTimeout(statusTimer);
   const r = await api("/api/status");
-  if (r.j?.ready) { S.status = r.j; if (S.drawer && S.tab === "system") renderDrawer(); }
-  statusTimer = setTimeout(pollStatus, S.drawer ? 3000 : 15000);
+  if (r.ok) { S.status = r.j; if (S.drawer && S.tab === "system") renderDrawer(); }
+  statusTimer = setTimeout(pollStatus, S.drawer ? 3000 : 20000);
 }
+setInterval(async () => {  // background loading progress for the home sheet
+  if (document.hidden || S.view !== "home") return;
+  const [lat, lon] = S.me ? [S.me.lat, S.me.lon] : unproj(V.cx, V.cy);
+  const r = await api(`/api/progress?lat=${lat}&lon=${lon}`);
+  if (r.ok) { const was = JSON.stringify(S.progress); S.progress = r.j.progress; if (was !== JSON.stringify(S.progress)) maybeRefreshViews(); }
+}, 4000);
 
 /* --------------------------------------------------------------- events */
 function connectEvents() {
   const es = new EventSource("/api/events");
   es.onmessage = async (m) => {
     const ev = JSON.parse(m.data);
-    if (ev.type === "forecast" && ev.mode) { location.reload(); return; }
-    if (ev.type === "report") { S.reports.push({ ...ev.report, ts: Date.now() / 1000 }); }
-    if (ev.type === "closures") { await loadClosures(); if (S.view === "dir") refreshPlan(); }
+    if (ev.type === "tiles") for (const k of ev.tiles) { const tl = TILES.get(k); if (tl && tl.status === "pending") { tl.status = "new"; tl.next = 0; } }
     if (ev.type === "forecast") {
-      await loadForecast(); loadClosures();
-      S.fresh = ev.label.includes("updated"); renderTimeline();
-      routeCache.key = null;
-      await refreshCommute();
-      if (S.view === "dir") refreshPlan();
-      if (S.view === "home") { if (S.user === "priya") scheduleNearby(); else refreshOps(); }
-      pollStatus();
+      for (const k of ev.tiles) { const tl = TILES.get(k); if (tl && tl.status === "ready") { tl.fcWant = true; tl.fcNext = 0; } }
+      if (S.sum && ev.run_id !== S.sum.run_id) await loadSummary();
+      clearTimeout(connectEvents.cm); connectEvents.cm = setTimeout(() => { refreshCommute(); if (S.view === "dir" && !S.planWait) refreshPlan(false); if (S.view === "home") { if (S.user === "priya") scheduleNearby(); else refreshOps(); } }, 1200);
     }
+    if (ev.type === "run") {
+      S.fresh = (ev.label || "").includes("updated");
+      const modeChanged = ev.mode && ev.mode !== S.sum?.mode;
+      const w = await api("/api/world"); if (w.ok) S.cfg = w.j;
+      await loadSummary();
+      for (const tl of TILES.values()) if (tl.status === "ready") { tl.fcWant = true; tl.fcNext = 0; }
+      if (modeChanged) { S.persona = null; S.commute = null; S.plan = null; stack.length = 0; S.view = "home"; S.t = 0; await loadPersona(); setUser("priya", true); }
+      else refreshCommute();
+      render(); pollStatus();
+    }
+    if (ev.type === "demo") { S.demo = { state: ev.state }; await loadPersona(); if (S.view === "home") render(); if (ev.state === "ready" && S.sum?.mode === "demo") { S.t = S.persona?.depart_min ?? 0; onTimeChange(); } }
+    if (ev.type === "report") S.reports.push({ ...ev.report, ts: Date.now() / 1000 });
+    if (ev.type === "closures") { await loadClosures(); if (S.view === "dir") refreshPlan(false); }
     if (ev.type === "alert") showToast(ev);
   };
 }
-document.addEventListener("visibilitychange", () => { if (!document.hidden && S.area) { loadForecast(); refreshCommute(); } });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && S.cfg) { loadSummary(); refreshCommute(); for (const tl of TILES.values()) if (tl.status === "ready") tl.fcWant = true; } });
 let toastTimer = null;
 function showToast(ev) {
   const t = $("#toast");
@@ -1602,5 +1825,35 @@ addEventListener("keydown", (e) => {
   if (e.key === "-") zoomAt(W / 2, H / 2, 1 / 1.6, true);
 });
 
+/* ---------------------------------------------------------------- boot */
+// No boot screen: the map shows immediately and fills in as tiles arrive.
+async function boot() {
+  applyTheme();
+  syncChips();
+  const start = prefs.last || null;
+  let w = await api("/api/world");
+  while (!w.ok) { await new Promise((r) => setTimeout(r, 1500)); w = await api("/api/world"); }
+  S.cfg = w.j;
+  const [lat, lon] = start || S.cfg.origin;
+  setOrigin(lat, lon);
+  centreOn(0, 0, 0.12, 0);
+  centreOn(0, 0, 0.35, 1400);
+  setUser("priya", true);
+  render();
+  sendFocus(true);
+  await loadSummary();
+  S.t = 0;
+  await loadPersona();
+  if (S.sum?.mode === "demo" && S.persona) S.t = S.persona.depart_min ?? 0;
+  render();
+  loadReports(); loadClosures();
+  connectEvents();
+  pollStatus();
+  initLocation(false);
+  scheduleNearby();
+  registerSW();
+  if (location.search.includes("commute")) openCommute();
+}
 resize();
+requestAnimationFrame(frame);
 boot();

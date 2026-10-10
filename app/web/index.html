@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>Paani Kahan</title>
-<meta name="description" content="Which streets will flood in the next 6 hours, and a dry route home.">
-<meta name="theme-color" content="#0b1215" media="(prefers-color-scheme: dark)">
-<meta name="theme-color" content="#eef1ef" media="(prefers-color-scheme: light)">
+<meta name="description" content="Which streets will flood in the next 6 hours, and a dry route home. Street level, 100 km around you.">
+<meta name="theme-color" content="#050505" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f2f2ee" media="(prefers-color-scheme: light)">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -15,13 +15,14 @@
 <link rel="apple-touch-icon" href="/static/icons/apple-180.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="/static/app.css?v=__V__">
 </head>
 <body>
 <canvas id="map" aria-label="Flood forecast map. Drag to pan, scroll or pinch to zoom, tap a street for details."></canvas>
 
-<div id="boot"><div class="boot-mark"><span class="drop"></span>Paani Kahan</div><ol id="boot-log"></ol></div>
+<div class="loadbar" id="loadbar"><i></i></div>
+<div class="demo-badge" id="demo-badge" hidden>Demo storm</div>
 
 <!-- search + chips -->
 <header class="top" id="top">
@@ -36,6 +37,7 @@
   <div class="chips" id="chips" role="group" aria-label="Map layers">
     <button class="chip on" data-layer="flood" aria-pressed="true"><i class="sw flood"></i>Flood depth</button>
     <button class="chip on" data-layer="rain" aria-pressed="true"><i class="sw rain"></i>Rain</button>
+    <button class="chip on" data-layer="terrain" aria-pressed="true"><i class="sw terrain"></i>Terrain</button>
     <button class="chip on" data-layer="closures" aria-pressed="true"><i class="sw closures"></i>Closures</button>
     <button class="chip" data-layer="sites" aria-pressed="false"><i class="sw sites"></i>Hospitals &amp; schools</button>
     <span class="chip info" id="offline" hidden></span>
