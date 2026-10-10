@@ -57,7 +57,7 @@ Each step is a keyed job on `app/world/scheduler.py`:
 
 ## Data sources and caching
 
-`app/world/net.py` wraps every upstream in an `Upstream`: per-host concurrency and pacing (Overpass gets one query at a time), retries with backoff, and a **circuit breaker** that opens after repeated server-side failures (not after 4xx, which are our fault), so a failing service degrades one layer instead of the whole app.
+`app/world/net.py` wraps every upstream in an `Upstream`: per-host concurrency and pacing (each Overpass mirror gets one or two queries at a time, and the mirrors are used in parallel, least busy first), retries with backoff, and a **circuit breaker** that opens after repeated server-side failures (not after 4xx, which are our fault), so a failing service degrades one layer instead of the whole app.
 
 | Data | Source | Cache |
 |---|---|---|
@@ -102,6 +102,7 @@ One document per street (not per street per frame) keeps the index ~37× smaller
 
 No framework, no build step. `app/web/app.js`:
 
+- **Base map first.** A raster base map (CARTO Positron / Dark Matter from OpenStreetMap, configurable with `BASEMAP`) is fetched directly from its CDN, so there is always a real, labelled map, even before our server answers or while a tile is still loading. While a tile loads, the nearest loaded ancestor is stretched in its place, so there are no holes. The canvas uses the same Web Mercator projection (scaled to metres at the session origin), so flood overlays sit exactly on the base map's roads. Our own street geometry is drawn only as a fallback when the base map can't load.
 - **Tile manager.** Every 350 ms: work out the visible tiles at both levels, fetch geometry (4 in flight, nearest the centre first) and forecasts (4 in flight), keep ~100 tiles in memory (LRU by last on-screen time).
 - **Renderer.** Canvas 2D. Per tile: `Path2D` per road class, a spatial hash for hit-testing, depth raster and rain canvases rebuilt only when time, mode or theme changes, wet-street paths bucketed by depth. Terrain shading is multiplied in (light) or screened inverted (dark).
 - **Focus.** On pan or zoom end and on a GPS fix, `POST /api/focus` tells the server where you are, which re-prioritises the queue.

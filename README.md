@@ -17,7 +17,7 @@ make up                 # or: finch compose up --build -d   (docker compose work
 open http://localhost:8080
 ```
 
-The map opens straight away. Streets load around you in the background:
+The map opens straight away. The base map (OpenStreetMap, drawn by CARTO) comes straight from a CDN, so there is always a full, labelled map whatever the server is doing. The flood forecast is drawn on top of it as streets load around you in the background:
 
 - **every street within 10 km**, nearest first;
 - **main roads and terrain for 100 km**;
@@ -110,6 +110,8 @@ The short version is below. [ARCHITECTURE.md](ARCHITECTURE.md) has the full desi
 
 - **Tiles.** The map is cut into Web-Mercator tiles: street-level (~5 km, 20 m flood grid) and main-road (~38 km, 150 m grid). Each tile is fetched, built and forecast independently.
 - **Priority queue.** What's on your screen goes first, then your route, then streets near you, then main roads out to 100 km, then everything else. Moving the map re-prioritises it.
+- **Always a map.** A raster base map from a CDN draws first, in the same Web Mercator projection as everything else, and is cached by the service worker for offline. Our own street geometry is used for flood depth, hit-testing and routing, and is drawn only if the base map can't load.
+- **Overpass in parallel.** Each public Overpass mirror has its own rate limit, so tiles are fetched from all mirrors at once, least-busy first.
 - **Caching.** Streets and terrain are cached on disk (30 days and forever). Rain comes from a fixed 0.125° lattice shared by all tiles, so tiles agree at their seams.
 - **Never blocking.** The newest finished forecast is shown while the next one computes. The browser is told by server-sent events when each tile is ready.
 - **Resilient upstreams.** Per-service rate limits, retries and circuit breakers. A slow or failing service degrades one layer, not the app. Its state shows in How it works → System.
@@ -228,6 +230,7 @@ Copy `.env.example` to `.env`. Everything is optional.
 | `CPU_WORKERS` | `3` | flood-model threads |
 | `DATA_SOURCE` | `osm` | `synthetic` = invented streets that work fully offline (labelled) |
 | `MODEL_PROVIDER` / `OLLAMA_MODEL` / `ANTHROPIC_API_KEY` | `ollama` / `llama3.2:3b` | the agent's model |
+| `BASEMAP` | `carto` | `carto` (Positron / Dark Matter), `osm` (openstreetmap.org tiles), `none`, or your own `https://…/{z}/{x}/{y}.png` template |
 | `TOMTOM_API_KEY` | | live closures and flooding from TomTom |
 | `LIVE_REFRESH_MIN` | `15` | live rain refresh |
 | `DEMO_NOW` | `16:10` | the clock in demo-storm mode |
@@ -254,4 +257,4 @@ Copy `.env.example` to `.env`. Everything is optional.
 
 ## Data and licences
 
-Streets, water bodies, localities and facilities: © OpenStreetMap contributors (ODbL). Elevation: Terrain Tiles, AWS Registry of Open Data (SRTM, public domain). Rain: Open-Meteo (CC BY 4.0), ERA5 (Copernicus). Font: Inter Tight (SIL OFL) via Google Fonts.
+Base map: © OpenStreetMap contributors, © CARTO (attribution shown on the map). Streets, water bodies, localities and facilities: © OpenStreetMap contributors (ODbL). Elevation: Terrain Tiles, AWS Registry of Open Data (SRTM, public domain). Rain: Open-Meteo (CC BY 4.0), ERA5 (Copernicus). Font: Inter Tight (SIL OFL) via Google Fonts.
