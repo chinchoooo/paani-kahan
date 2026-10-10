@@ -26,9 +26,10 @@ import numpy as np
 
 from .rain import TZ, _grid_points
 
-ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
-FORECAST = "https://api.open-meteo.com/v1/forecast"
-MARINE = "https://marine-api.open-meteo.com/v1/marine"
+import os
+ARCHIVE = os.getenv("OPEN_METEO_ARCHIVE_URL", "https://archive-api.open-meteo.com/v1/archive")
+FORECAST = os.getenv("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast")
+MARINE = os.getenv("OPEN_METEO_MARINE_URL", "https://marine-api.open-meteo.com/v1/marine")
 
 # Documented closures in past Chennai rain events (names as reported).
 HISTORY = [
@@ -58,10 +59,9 @@ REPLAYS = {
 
 
 def _get(url, params, timeout=20):
-    import httpx
-    r = httpx.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+    from ..world import net
+    up = net.METEO_ARCHIVE if "archive" in url else net.METEO
+    return up.get(url, params=params, retries=1, timeout=timeout).json()
 
 
 # ------------------------------------------------------------------ climate
@@ -183,20 +183,26 @@ def documented_reports(area):
     out = []
     segs = area.segments
     norm = lambda x: re.sub(r"[^a-z ]", "", x.lower().replace(".", ""))
+    names = {}
+    for s in segs:
+        names.setdefault(s.name, norm(s.name))
+    blob = "\n".join(names.values())
     for ev in HISTORY:
         for key in ev["subways"] + ev["roads"]:
             is_subway = key in ev["subways"]
             base = norm(key).replace(" road", "").strip()
+            if base.split()[0] not in blob:
+                continue
             if is_subway:
                 # the subway itself: an underpass, or a street named "<key> subway"
                 pat = re.compile(rf"\b{re.escape(base)}\b")
-                hits = [s for s in segs if pat.search(norm(s.name)) and (s.underpass or "subway" in norm(s.name))]
+                hits = [s for s in segs if pat.search(names[s.name]) and (s.underpass or "subway" in norm(s.name))]
             elif " " in norm(key) or key.endswith("Road"):
                 pat = re.compile(rf"^{re.escape(base)} (road|rd|salai|street|st)\b")  # "Park Road", not "Tech Park Rd"
-                hits = [s for s in segs if pat.search(norm(s.name))]
+                hits = [s for s in segs if pat.search(names[s.name])]
             else:
                 pat = re.compile(rf"\b{re.escape(base)}\b")
-                hits = [s for s in segs if pat.search(norm(s.name))]
+                hits = [s for s in segs if pat.search(names[s.name])]
             if not hits:
                 continue
             best = max(hits, key=lambda s: (s.underpass, s.length_m))

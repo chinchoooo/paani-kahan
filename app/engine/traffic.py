@@ -20,10 +20,10 @@ def key():
 
 
 def fetch_incidents(bbox, timeout=10):
-    import httpx
+    from ..world import net
     s, w, n, e = bbox
     fields = "{incidents{type,geometry{type,coordinates},properties{id,iconCategory,events{description},startTime,endTime,from,to}}}"
-    r = httpx.get("https://api.tomtom.com/traffic/services/5/incidentDetails", timeout=timeout, params={
+    r = net.TOMTOM.get(os.getenv("TOMTOM_URL", "https://api.tomtom.com/traffic/services/5/incidentDetails"), retries=1, params={
         "key": key(), "bbox": f"{w},{s},{e},{n}", "fields": fields, "language": "en-GB",
         "categoryFilter": "1,6,7,8,9,11,14", "timeValidityFilter": "present"})
     r.raise_for_status()
@@ -35,25 +35,26 @@ class SegmentIndex:
 
     def __init__(self, area):
         pts, owner = [], []
-        for sg in area.segments:
+        segs = area.segments.values() if isinstance(area.segments, dict) else area.segments
+        for sg in segs:
             for la, lo in sg.coords:
                 pts.append((la * 110_574, lo * area.m_per_deg_lon))
-                owner.append(sg.idx)
+                owner.append(sg.gid or sg.idx)
         self.mlon = area.m_per_deg_lon
         self.tree = cKDTree(np.array(pts)) if pts else None
-        self.owner = np.array(owner)
+        self.owner = np.array(owner, dtype=object)
 
     def nearest(self, lat, lon, max_m=40):
         if self.tree is None:
             return []
         d, i = self.tree.query([lat * 110_574, lon * self.mlon])
-        return [int(self.owner[i])] if d <= max_m else []
+        return [self.owner[i]] if d <= max_m else []
 
     def near(self, lat, lon, radius_m=25):
         if self.tree is None:
             return []
         idx = self.tree.query_ball_point([lat * 110_574, lon * self.mlon], radius_m)
-        return sorted(set(self.owner[idx].tolist()))
+        return sorted(set(self.owner[idx].tolist()), key=str)
 
 
 def to_closures(incidents, index):

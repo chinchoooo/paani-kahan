@@ -33,12 +33,14 @@ class Router:
         self.area = area
         self.G = nx.Graph()
         bar = getattr(area, "barriers", {}) or {}
-        for s in area.segments:
+        segs = area.segments.values() if isinstance(area.segments, dict) else area.segments
+        self.segs = {(s.gid or s.idx): s for s in segs}
+        for s in segs:
             cls = ROAD_CLASS.get(s.highway, 2)
             if self.G.has_edge(s.u, s.v) and self.G[s.u][s.v]["length"] <= s.length_m:
                 continue
             b = next((bar[n] for n in (s.nodes or []) if n in bar), None)
-            self.G.add_edge(s.u, s.v, seg=s.idx, length=s.length_m, cls=cls, construction=s.construction,
+            self.G.add_edge(s.u, s.v, seg=s.gid or s.idx, length=s.length_m, cls=cls, construction=s.construction,
                             underpass=s.underpass, barrier=(b or {}).get("type"), barrier_access=(b or {}).get("access", ""))
         self.closed = set()   # segments closed right now (live traffic incidents, resident reports)
         self.slow = {}        # segment -> time factor (roadworks)
@@ -78,7 +80,7 @@ class Router:
         for a, b in zip(path, path[1:]):
             e = self.G[a][b]
             t_mid = t + self._minutes(e, mode) / 2
-            d = int(sim.seg_depth[sim.frame_at(t_mid), e["seg"]])
+            d = int(sim.depth(e["seg"], sim.frame_at(t_mid)))
             out.append({"seg": e["seg"], "depth": d, "t": round(t_mid, 1)})
             t += self._minutes(e, mode)
         return out, t - depart_min
@@ -87,7 +89,7 @@ class Router:
         prof, mins = self.profile(path, mode, depart_min, sim)
         limit = LIMIT_CM[mode]
         worst = max(prof, key=lambda p: p["depth"]) if prof else None
-        segs = self.area.segments
+        segs = self.segs
         stretches, cur = [], None
         for p in prof:
             if p["depth"] >= limit:
@@ -127,16 +129,12 @@ class Router:
 
     def dry_path(self, o, d, mode, depart_min, sim, eta_guess):
         limit = LIMIT_CM[mode]
-        f0 = sim.frame_at(depart_min)
-        f1 = sim.frame_at(depart_min + eta_guess)
-        depth = np.maximum(sim.seg_depth[f0], sim.seg_depth[f1]).astype(float)
-        mid = sim.seg_depth[sim.frame_at(depart_min + eta_guess / 2)]
-        depth = np.maximum(depth, mid)
+        frames = sorted({sim.frame_at(depart_min), sim.frame_at(depart_min + eta_guess / 2), sim.frame_at(depart_min + eta_guess)})
 
         def w(a, b, e):
             if self._blocked(e, mode):
                 return None
-            dd = depth[e["seg"]]
+            dd = max(sim.depth(e["seg"], f) for f in frames)
             if dd >= limit * 0.8 or (e.get("underpass") and dd >= SUBWAY_CLOSE_CM):
                 return None  # too deep, or a subway the city will have closed
             return self._minutes(e, mode) * self._factor(e, mode) * (1 + 3 * (dd / limit) ** 2)
@@ -175,7 +173,7 @@ class Router:
                 for a, b in zip(raw, raw[1:]):
                     e = self.G[a][b]
                     if self._blocked(e, mode):
-                        avoided.append({"seg": e["seg"], "name": self.area.segments[e["seg"]].name,
+                        avoided.append({"seg": e["seg"], "name": self.segs[e["seg"]].name,
                                         "why": "under construction" if e.get("construction") else
                                                "closed" if e["seg"] in self.closed else f"{e.get('barrier')} on the road"})
         except nx.NetworkXNoPath:
@@ -197,7 +195,7 @@ class Router:
         for r in (usual, dry):
             if r:
                 r.pop("nodes", None)
-        subways = [p for p in usual["profile"] if self.area.segments[p[0]].underpass and p[1] >= SUBWAY_CLOSE_CM]
+        subways = [p for p in usual["profile"] if self.segs[p[0]].underpass and p[1] >= SUBWAY_CLOSE_CM]
         return {"status": status, "mode": mode, "mode_label": MODE_LABEL[mode], "limit_cm": LIMIT_CM[mode],
-                "avoided": avoided[:5], "subways_closed": [self.area.segments[s_].name for s_, _ in subways][:3],
+                "avoided": avoided[:5], "subways_closed": [self.segs[s_].name for s_, _ in subways][:3],
                 "depart_min": depart_min, "usual": usual, "dry": dry, "gmaps": link, "gmaps_usual": link_usual}
