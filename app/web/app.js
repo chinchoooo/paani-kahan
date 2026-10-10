@@ -43,11 +43,12 @@ function markOffline(when) {
 function markOnline() { if (S.offline) { S.offline = false; $("#offline").hidden = true; } }
 
 /* --------------------------------------------------------------- prefs */
-const PREF_KEY = "pk-prefs-v3";
-const LAYERS0 = { flood: true, rain: true, terrain: true, sites: false, closures: true };
+const PREF_KEY = "pk-prefs-v4";
+const LAYERS0 = { flood: true, rain: true, terrain: false, sites: false, closures: true };
 const prefs = Object.assign({ mode: null, theme: "auto", recent: [], notify: false, last: null }, (() => {
   try { return JSON.parse(localStorage.getItem(PREF_KEY) || "{}"); } catch { return {}; }
 })());
+try { if (!prefs.last) { const old = JSON.parse(localStorage.getItem("pk-prefs-v3") || "{}"); prefs.last = old.last; prefs.theme = old.theme || prefs.theme; prefs.mode = old.mode || prefs.mode; } } catch { /* blocked */ }
 prefs.layers = Object.assign({}, LAYERS0, prefs.layers || {});
 function savePrefs() {
   try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch { /* storage blocked */ }
@@ -112,11 +113,15 @@ const modeLabel = (m) => MODES.find((x) => x[0] === m)?.[1] || m;
 
 /* ------------------------------------------------------------ geometry */
 // One fixed equirectangular projection around the session origin (metres).
-const G = { lat0: 13, lon0: 80.2, mlat: 110574, mlon: 108000 };
-const proj = (lat, lon) => [(lon - G.lon0) * G.mlon, -(lat - G.lat0) * G.mlat];
-const unproj = (x, y) => [G.lat0 - y / G.mlat, G.lon0 + x / G.mlon];
+// Web Mercator scaled to metres at the session origin: the same projection as the basemap tiles,
+// so streets, water and the basemap line up exactly at every zoom.
+const RAD = Math.PI / 180, R_E = 6378137;
+const G = { lat0: 13, lon0: 80.2, s: R_E * Math.cos(13 * RAD), y0: 0 };
+const mercY = (lat) => Math.log(Math.tan(Math.PI / 4 + lat * RAD / 2));
+const proj = (lat, lon) => [(lon - G.lon0) * RAD * G.s, -(mercY(lat) - G.y0) * G.s];
+const unproj = (x, y) => [(2 * Math.atan(Math.exp(G.y0 - y / G.s)) - Math.PI / 2) / RAD, G.lon0 + x / G.s / RAD];
 function setOrigin(lat, lon) {
-  G.lat0 = lat; G.lon0 = lon; G.mlon = 111320 * Math.cos(lat * Math.PI / 180);
+  G.lat0 = lat; G.lon0 = lon; G.s = R_E * Math.cos(lat * RAD); G.y0 = mercY(lat);
   TILES.clear(); SEGS.clear(); routeCache.key = null;
 }
 function haversine(a, b, c, d) {
@@ -132,6 +137,62 @@ function tileXY(lat, lon, z) {
 function tileBBox(z, x, y) {
   const n = 2 ** z, lat = (yy) => Math.atan(Math.sinh(Math.PI * (1 - 2 * yy / n))) * 180 / Math.PI;
   return [lat(y + 1), x / n * 360 - 180, lat(y), (x + 1) / n * 360 - 180];
+}
+
+/* ------------------------------------------------------------- basemap */
+// A raster basemap (CARTO Positron / Dark Matter, from OpenStreetMap) that loads straight from a CDN,
+// independent of our server. Whatever state the flood data is in, there is always a real map.
+const BASE = {
+  cfg: { light: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", dark: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+    subdomains: "abcd", attribution: "© OpenStreetMap contributors © CARTO", maxZoom: 19 },
+  imgs: new Map(), loaded: 0, failed: 0, inflight: 0,
+};
+const baseOK = () => !!BASE.cfg && (BASE.loaded > 0 || BASE.failed < 6);
+function baseUrl(z, x, y) {
+  const c = BASE.cfg, sub = c.subdomains ? c.subdomains[(x + y) % c.subdomains.length] : "";
+  return (T.dark ? c.dark : c.light).replace("{s}", sub).replace("{z}", z).replace("{x}", x).replace("{y}", y).replace("{r}", DPR > 1 ? "@2x" : "");
+}
+function baseImg(z, x, y, load) {
+  const url = baseUrl(z, x, y);
+  let e = BASE.imgs.get(url);
+  if (!e && load && BASE.inflight < 16) {
+    const img = new Image();
+    e = { img, ok: false, used: 0 };
+    BASE.inflight++;
+    img.onload = () => { e.ok = true; BASE.loaded++; BASE.inflight--; };
+    img.onerror = () => { e.bad = true; BASE.failed++; BASE.inflight--; setTimeout(() => BASE.imgs.delete(url), 15000); };
+    img.src = url;
+    BASE.imgs.set(url, e);
+    if (BASE.imgs.size > 400) {  // LRU
+      const old = [...BASE.imgs.entries()].sort((a, b) => a[1].used - b[1].used).slice(0, 100);
+      for (const [u] of old) BASE.imgs.delete(u);
+    }
+  }
+  if (e) e.used = performance.now();
+  return e && e.ok ? e.img : null;
+}
+function drawBasemap() {
+  if (!BASE.cfg) return;
+  const mpp = 1 / V.k, n0 = 2 * Math.PI * G.s / 256;          // metres per tile pixel at z0 (in our units)
+  const z = clamp(Math.round(Math.log2(n0 / mpp)), 2, BASE.cfg.maxZoom || 19), n = 2 ** z;
+  const [ax, ay] = toWorld(0, 0), [bx, by] = toWorld(W, H);
+  const [lat1, lon0] = unproj(ax, ay), [lat0, lon1] = unproj(bx, by);
+  const [x0, y0] = tileXY(Math.min(lat1, 85), lon0, z), [x1, y1] = tileXY(Math.max(lat0, -85), lon1, z);
+  if ((x1 - x0 + 1) * (y1 - y0 + 1) > 120) return;
+  ctx.imageSmoothingEnabled = true;
+  for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) {
+    const bb = tileBBox(z, tx, ty), [px0, py0] = proj(bb[2], bb[1]), [px1, py1] = proj(bb[0], bb[3]);
+    let img = baseImg(z, tx, ty, true);
+    if (img) { ctx.drawImage(img, px0, py0, px1 - px0, py1 - py0); continue; }
+    // not loaded yet: stretch the nearest loaded ancestor so there's never a hole
+    for (let up = 1; up <= 6 && z - up >= 0; up++) {
+      const az = z - up, ax_ = tx >> up, ay_ = ty >> up, a = baseImg(az, ax_, ay_, up === 1);
+      if (!a) continue;
+      const span = 2 ** up, sw = a.naturalWidth / span, sx = (tx - (ax_ << up)) * sw, sy = (ty - (ay_ << up)) * sw;
+      ctx.drawImage(a, sx, sy, sw, sw, px0, py0, px1 - px0, py1 - py0);
+      break;
+    }
+  }
 }
 
 /* --------------------------------------------------------------- tiles */
@@ -454,8 +515,10 @@ function visibleTiles() {
 function draw(ts, dt) {
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   ctx.fillStyle = T.bg; ctx.fillRect(0, 0, W, H);
-  if (!S.cfg) return;
   const k = V.k, zw = Math.sqrt(clamp(k / 0.25, 0.35, 8)), px = 1 / k;
+  ctx.setTransform(DPR * k, 0, 0, DPR * k, DPR * (W / 2 - V.cx * k), DPR * (H / 2 - V.cy * k));
+  drawBasemap();
+  if (!S.cfg) { ctx.setTransform(DPR, 0, 0, DPR, 0, 0); drawMe(ts); return; }
   const vis = visibleTiles(), det = showDetail() ? vis.filter((t) => t.lod === "detail") : [], reg = vis.filter((t) => t.lod === "region");
   ctx.setTransform(DPR * k, 0, 0, DPR * k, DPR * (W / 2 - V.cx * k), DPR * (H / 2 - V.cy * k));
   // region underlay, clipped to where street-level tiles aren't loaded yet
@@ -486,8 +549,10 @@ function draw(ts, dt) {
 
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   if (prefs.layers.rain) drawRain(dt);
-  drawStreetLabels(det.length ? det : reg);
-  drawLocalityLabels(det.length && mpp() < 14 ? det : reg);
+  if (!baseOK()) {  // the basemap carries labels; ours are the offline fallback
+    drawStreetLabels(det.length ? det : reg);
+    drawLocalityLabels(det.length && mpp() < 14 ? det : reg);
+  }
   if (S.view === "dir" && S.plan) drawRouteMarkers(ts);
   if (S.view === "place" && S.place) dropPin(...proj(S.place.lat, S.place.lon));
   if (prefs.layers.sites && S.vuln) for (const p of S.vuln.sites || []) ring(...proj(p.lat, p.lon), p.name, ts);
@@ -501,7 +566,7 @@ function drawLayer(tiles, ts, px, zw, region) {
   for (const tl of tiles) {
     const a = clamp((now - tl.born) / 500, 0, 1);
     ctx.globalAlpha = a;
-    if (prefs.layers.terrain && tl.terrain instanceof Image) {
+    if (prefs.layers.terrain && tl.lod === "detail" && tl.terrain instanceof Image) {
       // light: multiply (white = no change). dark: inverted and screened, so low ground glows faintly
       ctx.globalCompositeOperation = T.dark ? "screen" : "multiply"; ctx.globalAlpha = a * (T.dark ? 0.16 : 0.6);
       if (T.dark) ctx.filter = "invert(1)";
@@ -510,27 +575,30 @@ function drawLayer(tiles, ts, px, zw, region) {
       ctx.drawImage(tl.terrain, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
       ctx.filter = "none"; ctx.globalCompositeOperation = "source-over"; ctx.globalAlpha = a;
     }
-    ctx.fillStyle = T.water; ctx.fill(tl.water);
+    if (!baseOK()) { ctx.fillStyle = T.water; ctx.fill(tl.water); }
   }
   ctx.globalAlpha = 1;
   ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
   for (const tl of tiles) {
     if (!tl.fc) continue;
     buildTileRaster(tl);
-    const r = tl.fc.rb, a = clamp((now - (tl.fcBorn || 0)) / 700, 0, 1);
+    const r = tl.fc.rb, a = clamp((now - (tl.fcBorn || 0)) / 700, 0, 1), wb = tl.wb;
+    ctx.save();
+    ctx.beginPath(); ctx.rect(wb.x0, wb.y0, wb.x1 - wb.x0, wb.y1 - wb.y0); ctx.clip();  // each tile paints only its own square: no seams
     if (prefs.layers.rain) { ctx.globalAlpha = a; ctx.drawImage(tl.rainCv, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0); }
-    if (prefs.layers.flood) {
+    if (prefs.layers.flood && !region) {  // main-road tiles: the coarse 150 m raster is noise; show their wet roads only
       ctx.globalCompositeOperation = T.dark ? "lighter" : "source-over";
       ctx.globalAlpha = 0.95 * a;
       ctx.drawImage(tl.rasCv, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
       ctx.globalCompositeOperation = "source-over";
     }
-    ctx.globalAlpha = 1;
+    ctx.restore();
   }
-  // streets
+  // streets (only as a fallback: normally the basemap draws them, and we draw just the water on them)
   ctx.lineCap = "round"; ctx.lineJoin = "round";
   const minor = region ? 1 : clamp((V.k - 0.04) / 0.12, 0, 1);  // fade in residential streets as you zoom in
   const wz = region ? Math.max(zw, 0.9) : zw;
+  if (!baseOK()) {
   for (const tl of tiles) {
     const a = clamp((now - tl.born) / 500, 0, 1);
     for (let c = 2; c >= 0; c--) {
@@ -544,6 +612,7 @@ function drawLayer(tiles, ts, px, zw, region) {
       if (al <= 0.02) continue;
       ctx.globalAlpha = al; ctx.strokeStyle = T.s[c]; ctx.lineWidth = BW[c] * wz * px; ctx.stroke(tl.base[c]);
     }
+  }
   }
   ctx.globalAlpha = 1;
   if (!prefs.layers.flood) return;
@@ -1830,14 +1899,16 @@ addEventListener("keydown", (e) => {
 async function boot() {
   applyTheme();
   syncChips();
-  const start = prefs.last || null;
+  const start = prefs.last || [12.979, 80.223];
+  setOrigin(start[0], start[1]);
+  centreOn(0, 0, 0.25, 0);   // the basemap shows right away, whatever the server is doing
   let w = await api("/api/world");
   while (!w.ok) { await new Promise((r) => setTimeout(r, 1500)); w = await api("/api/world"); }
   S.cfg = w.j;
-  const [lat, lon] = start || S.cfg.origin;
-  setOrigin(lat, lon);
-  centreOn(0, 0, 0.12, 0);
-  centreOn(0, 0, 0.35, 1400);
+  if (w.j.basemap !== undefined) BASE.cfg = w.j.basemap;
+  if (BASE.cfg) $("#attrib").textContent = BASE.cfg.attribution;
+  if (!prefs.last) { setOrigin(...S.cfg.origin); centreOn(0, 0, 0.25, 0); }
+  centreOn(0, 0, 0.4, 1200);
   setUser("priya", true);
   render();
   sendFocus(true);

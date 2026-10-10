@@ -10,6 +10,9 @@ const V = "__V__";
 const SHELL = `pk-shell-${V}`;
 const DATA = "pk-data-v3";
 const TERRAIN = "pk-terrain-v1";
+const BASEMAP = "pk-basemap-v1";
+const BASE_HOSTS = ["basemaps.cartocdn.com", "tile.openstreetmap.org"];
+let basePuts = 0;
 const SHELL_URLS = ["/", "/static/app.js?v=" + V, "/static/app.css?v=" + V, "/manifest.webmanifest",
   "/static/icons/icon-192.png", "/static/icons/icon-512.png"];
 const DATA_GET = ["/api/tile/", "/api/world", "/api/summary", "/api/commute", "/api/progress", "/api/status", "/api/search", "/api/nearby", "/api/segment", "/api/closures", "/api/reports"];
@@ -59,6 +62,19 @@ self.addEventListener("fetch", (e) => {
   if (req.method !== "GET") return;
   const url = new URL(req.url);
   if (url.pathname === "/api/events" || url.pathname.startsWith("/api/internal")) return;
+  if (BASE_HOSTS.some((h) => url.host.endsWith(h))) {  // basemap: cache first, so the map opens offline too
+    e.respondWith(caches.open(BASEMAP).then(async (c) => {
+      const hit = await c.match(req);
+      if (hit) return hit;
+      const r = await fetch(req);
+      if (r.ok || r.type === "opaque") {
+        c.put(req, r.clone());
+        if (++basePuts % 50 === 0) c.keys().then((ks) => ks.slice(0, Math.max(0, ks.length - 2000)).forEach((k) => c.delete(k)));
+      }
+      return r;
+    }));
+    return;
+  }
   if (url.origin === location.origin && url.pathname.endsWith("/terrain.png")) {  // immutable per tile build
     e.respondWith(caches.open(TERRAIN).then(async (c) => (await c.match(req)) || fetch(req).then((r) => { if (r.ok) c.put(req, r.clone()); return r; })));
     return;

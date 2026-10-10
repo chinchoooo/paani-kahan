@@ -247,6 +247,24 @@ app.mount("/static", StaticFiles(directory=WEB), name="static")
 
 
 # ------------------------------------------------------------------ world
+BASEMAPS = {
+    "carto": {"light": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+              "dark": "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+              "subdomains": "abcd", "attribution": "© OpenStreetMap contributors © CARTO", "maxZoom": 19},
+    "osm": {"light": "https://tile.openstreetmap.org/{z}/{x}/{y}.png", "dark": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            "subdomains": "", "attribution": "© OpenStreetMap contributors", "maxZoom": 19},
+}
+
+
+def basemap():
+    v = os.getenv("BASEMAP", "carto").strip()
+    if v == "none":
+        return None
+    if v.startswith("http"):  # a custom XYZ template
+        return {"light": v, "dark": v, "subdomains": "", "attribution": os.getenv("BASEMAP_ATTRIBUTION", "© OpenStreetMap contributors"), "maxZoom": 19}
+    return BASEMAPS.get(v, BASEMAPS["carto"])
+
+
 @app.get("/api/world")
 def world_info():
     run = W.rain.run
@@ -254,7 +272,7 @@ def world_info():
             "region_km": float(os.getenv("REGION_KM", "100")), "limits": LIMIT_CM, "origin": list(origin()),
             "users": {k: dict(u) for k, u in USERS.items()}, "mode": run.kind, "synthetic": W.synthetic,
             "run": {"id": run.id, "label": run.label, "now": list(run.now_hm), "anchor": run.detail.get("anchor")}, "demo": W.demo_status(),
-            "attribution": W.osm.attribution, "frames": len(FRAMES)}
+            "attribution": W.osm.attribution, "frames": len(FRAMES), "basemap": basemap()}
 
 
 class FocusReq(BaseModel):
@@ -637,7 +655,7 @@ def status():
                 "tomtom": {"enabled": bool(traffic.key()), "error": W.tt_error, "closed_segments": len(W.closed)},
                 "demo": W.demo_status()},
         "world": {"synthetic": W.synthetic, "progress": W.progress(), "jobs": W.sched.summary(), "recent": W.sched.recent[:12],
-                  "upstreams": [u.stats() for u in net.ALL], "net": list(net.NET_LOG)[:12],
+                  "upstreams": [u.stats() for u in net.all_upstreams()], "net": list(net.NET_LOG)[:12],
                   "tiles_loaded": sum(1 for t in list(W.tiles.values()) if t.status == "ready"),
                   "segments": sum(len(t.area.segments) for t in list(W.tiles.values()) if t.status == "ready")},
         "store": {"engine": STORE.store.engine, "warning": STORE.warning, "url": STORE.url},

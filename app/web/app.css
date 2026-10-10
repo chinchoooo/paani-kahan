@@ -381,3 +381,7 @@ details summary::-webkit-details-marker { display: none; }
 .notice pre { white-space: pre-wrap; }
 .demo-badge { position: fixed; z-index: 16; left: 50%; transform: translateX(-50%); top: calc(env(safe-area-inset-top, 0px) + 112px); background: var(--w1); color: #fff; font-size: 11px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; padding: 5px 10px; border-radius: 6px; pointer-events: none; }
 @media (min-width: 900px) { .demo-badge { top: 70px; left: calc(424px + (100vw - 504px) / 2); } }
+
+/* basemap attribution (required by OpenStreetMap / CARTO) */
+.attrib { position: fixed; z-index: 14; right: 70px; bottom: calc(var(--sheet-visible) + 80px); font-size: 10px; font-weight: 500; color: var(--mute); background: color-mix(in srgb, var(--panel) 75%, transparent); padding: 1px 6px; border-radius: 4px; pointer-events: none; transition: bottom .25s; }
+@media (min-width: 900px) { .attrib { right: 72px; bottom: 6px; } }
