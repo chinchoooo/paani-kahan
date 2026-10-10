@@ -32,7 +32,7 @@ def handler(event, context):
     req = urllib.request.Request(f"{APP_URL}/api/internal/tick", method="POST",
                                  data=json.dumps({"source": "sam-poller", "deliver": "return"}).encode(),
                                  headers={"content-type": "application/json"})
-    with urllib.request.urlopen(req, timeout=80) as r:
+    with urllib.request.urlopen(req, timeout=150) as r:
         result = json.loads(r.read())
     sns = _sns()
     topic_arn = sns.create_topic(Name=TOPIC_NAME)["TopicArn"]  # idempotent: returns the existing ARN

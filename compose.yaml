@@ -52,7 +52,11 @@ services:
       - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:3b}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - AREA=${AREA:-}
+      - DATA_SOURCE=${DATA_SOURCE:-osm}
+      - DEFAULT_ORIGIN=${DEFAULT_ORIGIN:-12.979,80.223}
+      - DETAIL_KM=${DETAIL_KM:-10}
+      - REGION_KM=${REGION_KM:-100}
+      - CPU_WORKERS=${CPU_WORKERS:-3}
       - RAIN_SOURCE=${RAIN_SOURCE:-live}
       - LIVE_REFRESH_MIN=${LIVE_REFRESH_MIN:-15}
       - TOMTOM_API_KEY=${TOMTOM_API_KEY:-}

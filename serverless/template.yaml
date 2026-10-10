@@ -27,7 +27,7 @@ Resources:
       CodeUri: poller/
       Handler: app.handler
       Runtime: python3.12
-      Timeout: 90
+      Timeout: 180
       MemorySize: 256
       Environment:
         Variables:

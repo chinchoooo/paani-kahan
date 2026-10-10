@@ -1,7 +1,7 @@
 # Uses Finch if installed, otherwise Docker.
 COMPOSE ?= $(shell command -v finch >/dev/null 2>&1 && echo "finch compose" || echo "docker compose")
 
-.PHONY: up down logs data tick tick-py reset model dev dashboards
+.PHONY: up down logs warm tick tick-py reset model dev dashboards
 
 up:            ## start everything, then open http://localhost:8080
 	$(COMPOSE) up --build -d
@@ -13,9 +13,8 @@ down:
 logs:
 	$(COMPOSE) logs -f app
 
-data:          ## fetch real Velachery streets + terrain (needs internet), then restart app
-	python3 scripts/fetch_area.py
-	-$(COMPOSE) restart app
+warm:          ## optional: pre-load streets and forecasts around Velachery (or LAT=.. LON=..) before recording
+	python3 scripts/warm.py $(LAT) $(LON)
 
 model:         ## pull the local model for the Strands agent
 	ollama pull llama3.2:3b

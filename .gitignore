@@ -1,5 +1,8 @@
-__pycache__/
 *.pyc
+*.zip
 .aws-sam/
 .env
-*.zip
+__pycache__/
+data/commutes.json
+data/reports.json
+data/world/

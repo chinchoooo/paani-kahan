@@ -1,8 +1,6 @@
-"""Synthetic sample area, used when real OpenStreetMap data has not been fetched.
+"""Synthetic sample area for engine tests (the app itself uses app/world tiles).
 
-Everything here is invented: street names, localities and terrain. The UI labels it
-"Sample area" so it is never mistaken for a real place. Run scripts/fetch_area.py to
-replace it with real Velachery data.
+Everything here is invented: street names, localities and terrain.
 """
 from __future__ import annotations
 
