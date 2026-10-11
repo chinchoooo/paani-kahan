@@ -11,6 +11,22 @@ The story: **Priya rides home at 6 PM. At 4:10 her route is fine. At 4:25 a new 
 
 ---
 
+## Fastest way: let the script record it
+
+`demo/record.py` drives the running app through the whole shot list below, burns in captions, and writes `demo.mp4`. Everything on screen is the live app on your machine.
+
+```bash
+pip install playwright imageio-ffmpeg pyttsx3
+python -m playwright install chromium
+make up && make model                                  # app + local model running
+python demo/record.py --lat 12.979 --lon 80.223        # where you want the story (default Velachery)
+python demo/record.py --voice                          # same, with your system voice reading the captions
+```
+
+What it does: loads the streets around that point, starts the demo storm there, waits for the demo commute, resets to 4:10 PM, warms the agent and the long-trip corridor (`--far Kanchipuram`), then records ~2:50 at 1440 × 900 plus a phone segment. The nowcast update is the real SAM Lambda (`sam local invoke PollerFunction`) when SAM is installed, so the alert really goes SNS → SQS on LocalStack; otherwise it runs the same handler directly (`--update python`), and the caption changes to stay true. A recorded human voiceover beats the system voice: record `demo.mp4` silent and talk over it in any editor.
+
+Two shots the script can't do, because they're outside the browser: the terminal running `sam local invoke` / `finch compose up`, and Google Maps on a real phone. Record those separately (10 s each) and cut them in at shots 5, 7 and 10 if you want them.
+
 ## Setup (30 minutes before recording)
 
 ```bash
@@ -36,15 +52,15 @@ Record the screen and the voice **separately**. Capture each shot below as its o
 
 ## Shot list
 
-Record on a laptop at 1440 × 900 (dark theme looks best on video), and grab two or three shots on a phone (Chrome DevTools device mode is fine) to show it's a real mobile app.
+Record on a laptop at 1440 × 900 (dark theme looks best on video; the blue **DEMO STORM** badge stays in frame), and grab two or three shots on a phone (Chrome DevTools device mode is fine) to show it's a real mobile app.
 
 | # | Time | On screen | Voiceover |
 |---|---|---|---|
 | 1 | 0:00 – 0:09 | Black. White text, one line at a time: *"July 9, 2026. Surat: 9 dead, 3,400 rescued."* / *"Delhi: streets underwater, a building down in Rohini."* / *"Every monsoon, the same streets flood. Every time, it's a surprise."* | "Every monsoon, the same streets flood." |
 | 2 | 0:09 – 0:20 | The app opens straight onto the map; streets fade in tile by tile and the blue dot finds you. Zoom out once: main roads for 100 km. | "Open it anywhere. Every street around you from OpenStreetMap, main roads for a hundred kilometres, on real terrain from AWS open data, loaded in the background. We forecast how deep the water will get on each one." |
-| 3 | 0:20 – 0:40 | Press **Space**. The rain sweeps in; streets turn blue, then amber, then red; the timeline fills. Scrub back to 6:00. | "Every ten minutes, six hours ahead. Rain the drains can't take runs downhill, fills the low spots, and spills over. Red means too deep to cross." |
+| 3 | 0:20 – 0:40 | Press **Space**. The rain sweeps in; streets turn light blue, deep blue, then red; the timeline fills. Scrub back to 6:00. | "Every ten minutes, six hours ahead. Rain the drains can't take runs downhill, fills the low spots, and spills over. Blue is water. Red is too deep to cross." |
 | 4 | 0:40 – 0:55 | Type a street in the search bar: results show their depth. Tap one: the sheet shows its depth curve and past reports, labelled OpenSearch. | "Search any street. It shows how deep it'll get and when, and what residents reported there before, searched by text and location in OpenSearch." |
-| 5 | 0:55 – 1:22 | Tap **Home at 6:00 PM**: directions, Clear. **Split screen:** terminal runs `sam local invoke PollerFunction` → `published alert for priya`. The notification drops in ("via LocalStack SNS → SQS"); the route turns red, the green dry route appears. | "Priya rides home at six. At 4:10 her route is clear. At 4:25 a new nowcast lands. A Lambda built with SAM re-runs the forecast and publishes to SNS; on LocalStack it fans out to SQS, and the alert reaches her before she leaves." |
+| 5 | 0:55 – 1:22 | Tap **Home at 6:00 PM**: directions, Clear. **Split screen:** terminal runs `sam local invoke PollerFunction` → `published alert for priya`. The notification drops in ("via LocalStack SNS → SQS"); the route turns red, and the dry route appears as a bold line. | "Priya rides home at six. At 4:10 her route is clear. At 4:25 a new nowcast lands. A Lambda built with SAM re-runs the forecast and publishes to SNS; on LocalStack it fans out to SQS, and the alert reaches her before she leaves." |
 | 6 | 1:22 – 1:40 | Tap **why?**: the agent's tool calls: `check_route`, `flood_history`, `best_departure`. | "The advice is written by an agent built with the Strands Agents SDK. Every number comes from a tool call." |
 | 7 | 1:40 – 1:58 | Tap **Start in Google Maps**. Cut to Google Maps on a phone with the route through the waypoints. | "Then it gets out of the way. One tap and she's navigating in Google Maps, on a route that stays dry." |
 | 8 | 1:58 – 2:15 | Phone: search a town 60–100 km away (Kanchipuram, Mahabalipuram) → directions straight away: main roads checked along the way, every street at both ends. | "Going further? The main roads for a hundred kilometres are already loaded, so it checks each stretch for when you'll actually get there." |

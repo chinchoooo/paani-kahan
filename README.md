@@ -33,6 +33,8 @@ make warm               # optional: pre-load Velachery (or LAT=13.08 LON=80.27) 
 make tick               # the nowcast update: SAM Lambda -> SNS -> SQS on LocalStack -> your browser
 ```
 
+**Record the demo video automatically:** `python demo/record.py` drives the app through the shot list in [DEMO.md](DEMO.md) and writes `demo.mp4` with captions (see DEMO.md for setup).
+
 <details>
 <summary>Updating from an earlier version</summary>
 
@@ -212,6 +214,7 @@ app/
   web/               the interface (no build step)
 serverless/          SAM template + poller Lambda
 scripts/             warm.py (pre-load), phone-lan.ps1
+demo/record.py       records the demo video from the running app
 tests/               fake upstreams for offline end-to-end runs
 ARCHITECTURE.md      the design
 DEMO.md              shot-by-shot demo plan
