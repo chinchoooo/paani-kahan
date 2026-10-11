@@ -37,7 +37,7 @@ from ..engine.routing import Router
 from .context import ContextService
 from .providers import make_providers
 from .rainfield import RainService, Run
-from .scheduler import IDLE, NEAR, REGION, ROUTE, VISIBLE, Scheduler
+from .scheduler import IDLE, NEAR, REGION, ROUTE, URGENT, VISIBLE, Scheduler
 from .tiles import DETAIL, REGION as REGION_LOD, TileKey, in_bbox, km_between, tile_of, tiles_in_bbox, tiles_within
 
 DETAIL_KM = float(os.getenv("DETAIL_KM", "10"))
@@ -670,6 +670,8 @@ class World:
         around you, then pick a commute that tells the story (watch at 4:10, flooded at 4:25)."""
         self.demo_state = "preparing"
         self.demo_persona = None
+        self.focus = None
+        self.set_focus(*anchor)  # everything is now ordered by distance from you
         threading.Thread(target=self._demo_job, args=(tuple(anchor),), daemon=True).start()
 
     def locality_of(self, lat, lon):
@@ -681,22 +683,24 @@ class World:
         try:
             run0, run1 = self.rain.demo_run(0), self.rain.demo_run(1)
             center = tile_of(*anchor, DETAIL.z)
-            keys = [center, *center.neighbours()]
-            for k in keys:
-                self.want(k, ROUTE, run=run0)
+            # your tile first, then the eight around it; both nowcasts, ahead of everything else
+            keys = sorted([center, *center.neighbours()], key=lambda k: km_between(anchor, k.center))
+            prio = {str(k): km_between(anchor, k.center) for k in keys}
             t0 = time.time()
             while time.time() - t0 < 300:
-                ts = [self.tiles[str(k)] for k in keys]
-                if all(t.status in ("ready", "empty", "failed") for t in ts):
-                    break
-                for t in ts:
+                for k in keys:
+                    t = self.want(k, URGENT, run=run0)   # (re)tries failed tiles after their backoff
                     if t.status == "ready":
-                        self._want_fc(t, run0, (ROUTE, 0))
+                        self._want_fc(t, run0, (URGENT, prio[str(k)]))
+                        self._want_fc(t, run1, (URGENT, 10 + prio[str(k)]))
+                ts = [self.tiles[str(k)] for k in keys]
+                if all(t.status in ("ready", "empty") for t in ts) or (time.time() - t0 > 90 and all(t.status in ("ready", "empty", "failed") for t in ts)):
+                    break
                 time.sleep(0.5)
             ready = [self.tiles[str(k)] for k in keys if self.tiles[str(k)].status == "ready"]
             for t in ready:
-                self._want_fc(t, run0, (ROUTE, 0))
-                self._want_fc(t, run1, (ROUTE, 1))
+                self._want_fc(t, run0, (URGENT, prio[str(t.key)]))
+                self._want_fc(t, run1, (URGENT, 10 + prio[str(t.key)]))
             self.wait_for([t.key for t in ready], run0.id, 240)
             self.wait_for([t.key for t in ready], run1.id, 240)
             if self.rain.source != "demo":

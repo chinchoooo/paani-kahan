@@ -15,7 +15,7 @@ import traceback
 from dataclasses import dataclass, field
 
 # priority classes (lower runs first)
-VISIBLE, ROUTE, NEAR, REGION, IDLE = 0, 1, 2, 3, 4
+URGENT, VISIBLE, ROUTE, NEAR, REGION, IDLE = -1, 0, 1, 2, 3, 4  # URGENT: the demo's streets around you
 
 
 @dataclass

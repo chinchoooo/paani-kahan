@@ -1803,6 +1803,7 @@ function connectEvents() {
       const w = await api("/api/world"); if (w.ok) S.cfg = w.j;
       await loadSummary();
       for (const tl of TILES.values()) if (tl.status === "ready") { tl.fcWant = true; tl.fcNext = 0; }
+      if (modeChanged && ev.mode === "demo" && S.me) centreOn(...proj(S.me.lat, S.me.lon), Math.max(V.k, 0.35));  // the storm is centred on you
       if (modeChanged) { S.persona = null; S.commute = null; S.plan = null; stack.length = 0; S.view = "home"; S.t = 0; await loadPersona(); setUser("priya", true); }
       else refreshCommute();
       render(); pollStatus();
