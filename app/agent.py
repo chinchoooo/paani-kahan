@@ -4,7 +4,11 @@ The agent gets three tools backed by the flood engine and OpenSearch, decides wh
 to call, and writes a two-line phone notification. Every tool call is recorded so the
 UI can show how the advice was reached.
 
-Model: a local model through Ollama by default (no account needed). Set
+Model: a local model through Ollama by default (no account needed). Models with
+native tool calling (llama3.1+, llama3.2, qwen2.5) let the agent pick its tools. Older
+ones (llama3, phi3) can't take tools, so the app runs the same three tools in the
+fixed order the system prompt asks for and the Strands agent writes the notification
+from their outputs; the UI says which happened. Set
 MODEL_PROVIDER=anthropic and ANTHROPIC_API_KEY to use Claude instead. If no model is
 reachable, a deterministic template writes the advice from the same tool outputs and
 the UI labels it 'template'.
@@ -65,6 +69,42 @@ def model_status():
         return {"provider": "ollama", "model": OLLAMA_MODEL, "ready": False, "note": f"Ollama not reachable at {OLLAMA_HOST}"}
 
 
+_caps: dict[str, bool] = {}
+
+
+def ollama_tools_ok() -> bool:
+    """Does the Ollama model support native tool calling? (cached; asks /api/show)."""
+    if OLLAMA_MODEL not in _caps:
+        try:
+            r = httpx.post(f"{OLLAMA_HOST}/api/show", json={"model": OLLAMA_MODEL}, timeout=3)
+            caps = r.json().get("capabilities")
+            _caps[OLLAMA_MODEL] = ("tools" in caps) if isinstance(caps, list) else True
+        except Exception:  # noqa: BLE001
+            return True
+    return _caps[OLLAMA_MODEL]
+
+
+WRITER = """You are Paani Kahan, a monsoon commute assistant.
+You write one phone notification for a commuter about street flooding on their route,
+using ONLY the tool results you are given. Do not invent streets, numbers or times.
+
+Safe depth limits: two-wheeler 30 cm, car 45 cm, walking 25 cm.
+
+Reply in exactly this format and nothing else:
+HEADLINE: <at most 8 words>
+ADVICE: <one sentence, at most 32 words>
+
+Name the worst street and its forecast depth in cm. If a dry route exists, say how many
+minutes it adds."""
+
+
+def _numbers_grounded(text: str, trace) -> bool:
+    """Every 'NN cm' in the model's text must appear in a tool result."""
+    blob = json.dumps([t["result"] for t in trace])
+    have = set(re.findall(r"\d+", blob))
+    return all(n in have for n in re.findall(r"(\d+)\s*cm", text))
+
+
 def _model():
     if PROVIDER == "anthropic":
         from strands.models.anthropic import AnthropicModel
@@ -80,6 +120,7 @@ class Advisor:
     def __init__(self, ctx):
         self.ctx = ctx
         self.trace = []
+        self.tools_by = None
 
     # ---------------------------------------------------------------- tools
     def _record(self, name, args, result, t0):
@@ -159,12 +200,23 @@ class Advisor:
             return adv.best_departure()
 
         c = self.ctx
-        agent = Agent(model=_model(), tools=[check_route, flood_history, best_departure],
-                      system_prompt=SYSTEM, callback_handler=None)
         who = "The commuter" if c["persona"]["name"] == "You" else c["persona"]["name"]
         prompt = (f"{who} rides a {c['mode'].replace('_', '-')} from {c['persona']['from_label']} "
                   f"to {c['persona']['to_label']}. It is {clock(c['now'], 0)} now. Departure in "
                   f"{c['depart_min']} minutes ({clock(c['now'], c['depart_min'])}). Write the notification.")
+        if PROVIDER == "ollama" and not ollama_tools_ok():
+            # The model can't take tools: run them in the order SYSTEM prescribes, then let the agent write.
+            r = json.loads(self.check_route(c["depart_min"]))
+            if r["usual_route"]["flooded_streets"] and r["usual_route"]["worst_street"]:
+                self.flood_history(r["usual_route"]["worst_street"])
+                self.best_departure()
+            results = "\n".join(f"{t['tool']}({json.dumps(t['args'])}) -> {json.dumps(t['result'])}" for t in self.trace)
+            agent = Agent(model=_model(), system_prompt=WRITER, callback_handler=None)
+            self.tools_by = "app"
+            return str(agent(f"{prompt}\n\nTool results:\n{results}"))
+        agent = Agent(model=_model(), tools=[check_route, flood_history, best_departure],
+                      system_prompt=SYSTEM, callback_handler=None)
+        self.tools_by = "agent"
         return str(agent(prompt))
 
     def template(self):
@@ -203,12 +255,16 @@ class Advisor:
                 text = _pool.submit(self._run_strands).result(timeout=TIMEOUT_S)
                 m1 = re.search(r"HEADLINE:\s*(.+)", text)
                 m2 = re.search(r"ADVICE:\s*(.+)", text, re.S)
-                if m1 and m2:
+                if m1 and m2 and _numbers_grounded(text, self.trace):
                     head, adv = m1.group(1).strip().strip('"'), " ".join(m2.group(1).split()).strip('"')
                     engine = f"strands · {st['provider']} · {st['model']}"
+                    if self.tools_by == "app":
+                        engine += " · tools run by app"
+                elif m1 and m2:
+                    st["note"] = "Agent used a number no tool returned; showing the template instead"
             except Exception as e:  # noqa: BLE001
                 st["note"] = f"Agent failed: {type(e).__name__}: {e}"[:200]
         if head is None:
             head, adv = self.template()
-        return {"headline": head, "advice": adv, "engine": engine, "model": st,
+        return {"headline": head, "advice": adv, "engine": engine, "model": st, "tools_by": self.tools_by,
                 "trace": self.trace, "ms": round((time.perf_counter() - t0) * 1000)}

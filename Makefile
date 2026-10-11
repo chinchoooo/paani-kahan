@@ -17,7 +17,7 @@ warm:          ## optional: pre-load streets and forecasts around Velachery (or 
 	python3 scripts/warm.py $(LAT) $(LON)
 
 model:         ## pull the local model for the Strands agent
-	ollama pull llama3.2:3b
+	ollama pull $(or $(OLLAMA_MODEL),llama3.2:3b)
 
 tick:          ## nowcast update via the SAM-built Lambda -> SNS -> SQS (LocalStack)
 	cd serverless && sam local invoke PollerFunction

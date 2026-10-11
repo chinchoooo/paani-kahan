@@ -1713,7 +1713,8 @@ function whyTab() {
   if (!a) return `<div class="empty">Open directions for a trip to see how the agent wrote its advice.</div>`;
   return `<div class="blk"><h5>Agent <small>${esc(a.engine)}</small></h5>
       <dl class="kv"><dt>Framework</dt><dd>Strands Agents SDK</dd><dt>Model</dt><dd>${esc(a.model.provider)} · ${esc(a.model.model)}${a.model.ready ? "" : ` (${esc(a.model.note || "not ready")})`}</dd><dt>Took</dt><dd class="num">${a.ms} ms</dd></dl>
-      ${a.engine === "template" ? `<div class="hint">No model was reachable, so a template wrote the advice from the same tool results.</div>` : ""}</div>
+      ${a.engine === "template" ? `<div class="hint">${a.model.ready && a.model.note ? esc(a.model.note) + ". " : "No model was reachable, so "}A template wrote the advice from the same tool results.</div>` : ""}
+      ${a.tools_by === "app" && a.engine !== "template" ? `<div class="hint">${esc(a.model.model)} has no native tool calling, so the app ran the tools in the order the agent's instructions set, and the agent wrote the notification from their results.</div>` : ""}</div>
     <div class="blk"><h5>Tool calls</h5>${a.trace.map((t) => `<div class="step"><span class="tn">${esc(t.tool)}(${esc(Object.entries(t.args).map(([k, v]) => `${k}=${v}`).join(", "))})<small>${t.ms} ms</small></span>${pre(t.result)}</div>`).join("")}
       <div class="step"><span class="tn">notification</span><div><b>${esc(a.headline)}</b><br>${esc(a.advice)}</div></div></div>`;
 }

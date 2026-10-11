@@ -33,6 +33,7 @@ Two shots the script can't do, because they're outside the browser: the terminal
 make up
 make warm                     # pre-load Velachery (or LAT=.. LON=.. for where you'll record) so nothing loads on camera
 make model                    # ollama pull llama3.2:3b, and keep Ollama running
+                              # already have llama3? put OLLAMA_MODEL=llama3 and AGENT_TIMEOUT_S=120 in .env instead
 # in the app: How it works → System → Demo storm here   (centred on the map / your location; wait for the demo commute)
 make reset                    # back to the 4:10 PM nowcast
 ```

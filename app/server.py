@@ -147,12 +147,16 @@ def check_commute_alerts(wait=False):
 
 def advise_for(trip, mode, depart, router=None, sim=None):
     key = (W.rain.run.id, mode, depart, tuple(trip["from"]), tuple(trip["to"]), len(W.resident))
+    hit = ADVICE.get(key)
+    if hit is not None and hit["engine"] == "template" and time.time() - hit.get("_at", 0) > 30:
+        hit = ADVICE.pop(key)  # a cold or busy model fell back once; try the agent again
     if key not in ADVICE:
         if router is None:
             _, router, sim = W.plan(trip["from"], trip["to"], mode, depart)
         st = STORE.store
         ADVICE[key] = Advisor({"router": router, "sim": sim, "store": st, "persona": trip, "mode": mode,
                                "depart_min": min(depart, 340), "now": W.rain.run.now_hm}).run()
+        ADVICE[key]["_at"] = time.time()
         while len(ADVICE) > 40:
             ADVICE.pop(next(iter(ADVICE)))
     return ADVICE[key]

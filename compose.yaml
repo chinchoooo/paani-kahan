@@ -51,6 +51,7 @@ services:
       - MODEL_PROVIDER=${MODEL_PROVIDER:-ollama}
       - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:3b}
+      - AGENT_TIMEOUT_S=${AGENT_TIMEOUT_S:-60}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - DATA_SOURCE=${DATA_SOURCE:-osm}
       - DEFAULT_ORIGIN=${DEFAULT_ORIGIN:-12.979,80.223}

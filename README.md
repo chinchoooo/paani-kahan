@@ -232,7 +232,7 @@ Copy `.env.example` to `.env`. Everything is optional.
 | `DETAIL_KM` / `REGION_KM` | `10` / `100` | street-level / main-road coverage around you |
 | `CPU_WORKERS` | `3` | flood-model threads |
 | `DATA_SOURCE` | `osm` | `synthetic` = invented streets that work fully offline (labelled) |
-| `MODEL_PROVIDER` / `OLLAMA_MODEL` / `ANTHROPIC_API_KEY` | `ollama` / `llama3.2:3b` | the agent's model |
+| `MODEL_PROVIDER` / `OLLAMA_MODEL` / `ANTHROPIC_API_KEY` | `ollama` / `llama3.2:3b` | the agent's model. Any Ollama model works: with native tool calling (llama3.2, qwen2.5) the agent picks its tools; without it (llama3, phi3) the app runs the same tools and the agent writes the advice from their results. Numbers the model makes up are rejected. |
 | `BASEMAP` | `osm` | `osm` (OpenStreetMap tiles in black and white, no key), `osm-color`, `carto` (needs `CARTO_API_KEY`), `none`, or your own `https://…/{z}/{x}/{y}.png` template |
 | `TOMTOM_API_KEY` | | live closures and flooding from TomTom |
 | `LIVE_REFRESH_MIN` | `15` | live rain refresh |
@@ -245,7 +245,7 @@ Copy `.env.example` to `.env`. Everything is optional.
 - **Phone: "Open on your phone" shows no link** after starting the tunnel: wait 10 seconds and try again; check `finch compose logs tunnel` for a `trycloudflare.com` line.
 - **Phone: the location button says it needs HTTPS:** you opened the Wi-Fi address; use the phone link.
 - **OpenSearch exits on Linux:** `sudo sysctl -w vm.max_map_count=262144`. The app runs on its in-memory store until OpenSearch is up, then switches over.
-- **Agent shows "Template":** start Ollama (`ollama serve`) and `make model`.
+- **Agent shows "Template":** start Ollama (`ollama serve`) and `make model`. On Windows, the app runs inside Finch's VM, so Ollama must listen beyond localhost: set the user environment variable `OLLAMA_HOST=0.0.0.0`, quit Ollama from the tray and start it again, allow it through the firewall if asked, then check with `finch compose exec app curl -s http://host.docker.internal:11434/api/tags`.
 - **`sam local invoke` can't reach the app:** it runs on the `paani-net` network, so the app must be running via compose.
 - **LocalStack asks for an auth token:** the compose file pins `localstack/localstack:3.8.1`, which doesn't need one. Without LocalStack, use How it works → System → *Run nowcast update* (in-process; the UI says so).
 
