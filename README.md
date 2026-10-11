@@ -245,7 +245,7 @@ Copy `.env.example` to `.env`. Everything is optional.
 - **Phone: "Open on your phone" shows no link** after starting the tunnel: wait 10 seconds and try again; check `finch compose logs tunnel` for a `trycloudflare.com` line.
 - **Phone: the location button says it needs HTTPS:** you opened the Wi-Fi address; use the phone link.
 - **OpenSearch exits on Linux:** `sudo sysctl -w vm.max_map_count=262144`. The app runs on its in-memory store until OpenSearch is up, then switches over.
-- **Agent shows "Template":** start Ollama (`ollama serve`) and `make model`. On Windows, the app runs inside Finch's VM, so Ollama must listen beyond localhost: set the user environment variable `OLLAMA_HOST=0.0.0.0`, quit Ollama from the tray and start it again, allow it through the firewall if asked, then check with `finch compose exec app curl -s http://host.docker.internal:11434/api/tags`.
+- **Agent shows "Template":** start Ollama (`ollama serve`) and `make model`. On Windows, the app runs inside Finch's VM, so Ollama must listen beyond localhost: set the user environment variable `OLLAMA_HOST=0.0.0.0`, quit Ollama from the tray and start it again, allow it through the firewall if asked, then check with `finch compose exec app python -c "import urllib.request as u; print(u.urlopen('http://host.docker.internal:11434/api/tags').read().decode())"`.
 - **`sam local invoke` can't reach the app:** it runs on the `paani-net` network, so the app must be running via compose.
 - **LocalStack asks for an auth token:** the compose file pins `localstack/localstack:3.8.1`, which doesn't need one. Without LocalStack, use How it works → System → *Run nowcast update* (in-process; the UI says so).
 
