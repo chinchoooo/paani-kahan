@@ -6,6 +6,10 @@ Built for Environmental Hacks 2026 (Track 02: Heat and Water) with AWS open-sour
 
 ![Paani Kahan](docs/screenshot.png)
 
+**Demo video:** [YouTube link] · **Blog:** [AWS Builder Center link]
+
+![Architecture: from a rain forecast to an alert on your phone](docs/diagrams/architecture.png)
+
 ---
 
 ## Run it
@@ -108,6 +112,8 @@ It prints an address like `http://192.168.1.20:8081` to open on the phone. To sh
 
 ## How it loads data
 
+![Your streets first, then 100 km in the background](docs/diagrams/tiles.png)
+
 The short version is below. [ARCHITECTURE.md](ARCHITECTURE.md) has the full design.
 
 - **Tiles.** The map is cut into Web-Mercator tiles: street-level (~5 km, 20 m flood grid) and main-road (~38 km, 150 m grid). Each tile is fetched, built and forecast independently.
@@ -133,6 +139,8 @@ The short version is below. [ARCHITECTURE.md](ARCHITECTURE.md) has the full desi
 
 ## What it does
 
+![Rain the drains can't take runs downhill and fills the low spots](docs/diagrams/flood-model.png)
+
 1. **Forecasts depth per street, every 10 minutes, 6 hours ahead**, for every street around you.
 2. **Checks your saved commute** at the time you'd actually reach each street, against a safe limit for how you travel: 30 cm on a two-wheeler, 45 cm by car, 25 cm on foot.
 3. **Finds a dry route** and opens it in **Google Maps** with waypoints that pin it there.
@@ -154,6 +162,8 @@ The short version is below. [ARCHITECTURE.md](ARCHITECTURE.md) has the full desi
 **Accuracy, honestly:** this is calibrated to Chennai's rainfall climate and checked against past storms, not validated street by street. That needs measured flood depths and the city's drain network, which aren't public.
 
 ## Where each AWS tool fits
+
+![The alert path, from a new nowcast to the phone](docs/diagrams/alert-flow.png)
 
 ```mermaid
 flowchart LR
